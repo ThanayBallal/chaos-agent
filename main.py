@@ -43,7 +43,7 @@ def main():
         mck = {res["target"]: res for res in load("mock_results.json")}
         rsl = []
         for exp in pln:
-            rej = guard.approve(exp, dep)
+            rej = guard.approve(exp, dep, mock=opt.mock)
             if rej:
                 print(f" [guard] rejected {exp['id']}: {rej}")
             elif exp["target"] in mck:
@@ -52,7 +52,7 @@ def main():
         from monitor import runner
         rsl = []
         for exp in pln:
-            rej = guard.approve(exp, dep)
+            rej = guard.approve(exp, dep, mock=opt.mock)
             if rej:
                 print(f" [guard] rejected {exp['id']}: {rej}")
                 continue
