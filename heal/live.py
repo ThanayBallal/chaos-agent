@@ -150,7 +150,7 @@ def understand(state, config):
 def guard_approve(state, config):
     exp = state["experiment"]
     guard.reset()
-    rej = ports.approve(exp, state["depmap"])
+    rej = exp.get("rejection") or ports.approve(exp, state["depmap"])  # auto mode may arrive already rejected
     log("guard_approve", f"rejected: {rej}" if rej else "approved")
     return {"experiment": {**exp, "rejection": rej}}
 

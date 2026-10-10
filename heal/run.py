@@ -1,10 +1,12 @@
 """Run the heal graph:
 python -m heal.run "prompt" --stub [--scenario retry|healed|unhealed|rejected] [--harden round1|round2|never]
 python -m heal.run "prompt" --live [--baseline-s 30] [--pause-before-heal]
+python -m heal.run --auto --live|--stub [--refresh]   (no prompt: the chaos agent picks the top code-review weakness)
     (real robot-shop; STOP file or Ctrl+C reverts everything; --pause-before-heal holds the broken app after injection
     until Enter or 90 s, then heals with a fresh 60 s deadline)"""
 import argparse
 import json
+import os
 import sys
 
 from heal import graph
@@ -17,7 +19,13 @@ def _kept(val):
 def show(rpt):
     """prompt -> experiment -> blind diagnosis (correct?) -> actions -> healed in Xs -> hardening -> LLM vs fallback."""
     exp, dxs = rpt.get("experiment_detail") or {}, rpt.get("diagnosis")
-    print(f"== Prompt: {rpt.get('prompt')!r}")
+    aut = rpt.get("auto") or {}
+    if rpt.get("mode") == "auto":
+        num, skp = len(rpt.get("weaknesses") or []), len(aut.get("skipped") or [])
+        print(f"== Mode: auto (" + (f"chose weakness #{aut['chosen']} of {num}" if aut.get("chosen")
+                                    else f"no weakness chosen of {num}") + f" from the code review, skipped {skp})")
+    else:
+        print(f"== Prompt: {rpt.get('prompt')!r}")
     if exp:
         print(f"== Experiment: {exp['fault']} {exp['target']} {json.dumps(exp['params'])}"
               + (f"  REJECTED by guard: {exp['rejection']}" if exp.get("rejection") else ""))
@@ -76,36 +84,46 @@ def safe_output():
 def main(argv=None):
     safe_output()
     arg = argparse.ArgumentParser(prog="python -m heal.run")
-    arg.add_argument("prompt")
+    src = arg.add_mutually_exclusive_group()
+    src.add_argument("prompt", nargs="?", help="what to break, e.g. \"kill redis\" (or use --auto)")
+    src.add_argument("--auto", action="store_true",
+                     help="no prompt: the chaos agent tests the top-ranked code-review weakness the guard approves")
     mod = arg.add_mutually_exclusive_group()
     mod.add_argument("--stub", action="store_true", help="run the stub graph (fake data, no Docker)")
     mod.add_argument("--live", action="store_true", help="run against the live robot-shop compose project")
     arg.add_argument("--scenario", default="retry", choices=graph.SCENARIOS, help="stub heal outcome")
     arg.add_argument("--harden", default="round1", choices=graph.HARDEN, help="stub: which hardening round improves")
     arg.add_argument("--baseline-s", type=int, default=30, help="live: seconds of baseline traffic to capture")
+    arg.add_argument("--refresh", action="store_true", help="redo the code review instead of reusing the cached one")
     arg.add_argument("--pause-before-heal", action="store_true",
                      help="live: after injection wait for Enter (or 90 s) before healing, kill switch armed")
     try:
         opt = arg.parse_args(argv)
     except SystemExit as err:
         return err.code
+    if opt.prompt is None and not opt.auto:
+        print("give a prompt or --auto", file=sys.stderr)
+        return 2
     if not (opt.stub or opt.live):
         print("choose --stub or --live", file=sys.stderr)
         return 2
     if opt.pause_before_heal and not opt.live:
         print("--pause-before-heal needs --live", file=sys.stderr)
         return 2
+    if opt.refresh:
+        os.environ["CHAOS_REVIEW_FRESH"] = "1"  # agent.code_review: skip the cached LLM review
     if opt.live:
         from safety import guard
         guard.install()  # stale STOP removed; Ctrl+C and exit revert every registered fault
-        sta, pth = graph.run(opt.prompt, live=True, baseline_s=opt.baseline_s, hold=opt.pause_before_heal)
+        sta, pth = graph.run(opt.prompt, live=True, baseline_s=opt.baseline_s, hold=opt.pause_before_heal,
+                             auto=opt.auto)
     else:
-        sta, pth = graph.run(opt.prompt, opt.scenario, harden=opt.harden)
+        sta, pth = graph.run(opt.prompt, opt.scenario, harden=opt.harden, auto=opt.auto)
     rpt = sta.get("report", {})
     print("== Path ==")
     print(" -> ".join(pth))
     print(f"== Report: outcome={rpt.get('outcome')} hardening={rpt.get('hardening')} attempts={rpt.get('attempts')} "
-          f"rounds={rpt.get('rounds')} experiment={rpt.get('experiment')} target={rpt.get('target')} "
+          f"rounds={rpt.get('rounds')} mode={rpt.get('mode')} experiment={rpt.get('experiment')} target={rpt.get('target')} "
           f"score={rpt.get('score')} ==")
     if rpt.get("abort"):
         print(f"== Aborted: {rpt['abort']} ==")

@@ -12,6 +12,9 @@ Harden (make the app survive the fault next time, at most MAX_ROUNDS):
 Kill switch while hardening (STOP file, checked before every hardening fix and after every compare): straight to
   guard_revert -> report, outcome stopped_by_kill_switch; no further patch is applied.
 Live runs write the full report to data/heal_report.json (never in stub mode).
+Mode (state["mode"], recorded in the report): "prompt" (default) or "auto" (run(None, ..., auto=True), heal.run --auto).
+  In auto mode chaos_agent prints the top code-review weaknesses (code read from the files themselves) and plans the
+  top-ranked one the guard approves (agents.plan_auto, at most agents.AUTO_TRY); everything after it is the same.
 
 remediation_agent / apply_fix may only use HEAL_CATALOG actions; hardening patches (patcher.make output) only
 appear in harden_agent / apply_hardening. revert_patch only runs between round 1 and round 2.
@@ -95,6 +98,8 @@ class HealState(TypedDict, total=False):
     diagnosis_score: dict
     hardening_log: list
     stopped: str
+    mode: str
+    auto: dict
 
 
 def log(nam, msg):
@@ -215,9 +220,39 @@ def _cap(state):
     return None if unt is None else min(LLM_S, unt - time.monotonic() - RESERVE_S)
 
 
+def show_weaknesses(wks, mdl):
+    """The auto-mode "Code review" section: ranked weaknesses with service, file:line, the code read from that line."""
+    print(f"== Code review ({mdl.get('source')}, {mdl.get('files_read', 0)} files): top {len(wks)} weaknesses")
+    for wek in wks:
+        print(f" {wek['rank']}. {wek['service']} -> {wek['dependency']} ({wek['fault']})  {wek['file']}:{wek['line']}")
+        print(f"    code: {wek['code']}")
+        print(f"    weakness: {wek['weakness']}")
+    if not wks:
+        print("   no weakness whose file:line could be read from the source")
+
+
+def _auto_chaos(state):
+    """Auto mode: show the weaknesses, then plan the top-ranked one the guard approves."""
+    mdl = state.get("app_model") or {}
+    wks = agents.weaknesses(mdl.get("risks", []), state["depmap"])
+    show_weaknesses(wks, mdl)
+    exp, met, skp = agents.plan_auto(wks, state["depmap"])
+    for itm in skp:
+        print(f"== Auto: skipped weakness #{itm['rank']} ({itm['experiment']}, {itm['where']}): {itm['why']}")
+    chs = None if exp.get("rejection") else len(skp) + 1
+    print(f"== Auto: chose weakness #{chs}: {exp['fault']} {exp['target']}" if chs else f"== Auto: {exp['rejection']}")
+    exp["stub"] = True
+    log("chaos_agent", f"[{met['source']}] {exp['fault']} {exp['target']} {exp['params']}: {exp['reason'][:120]}")
+    return {"experiment": exp, "agents": _agents(state, "chaos_agent", met),
+            "auto": {"weaknesses": wks, "skipped": skp, "chosen": chs}}
+
+
 def chaos_agent(state, config: RunnableConfig):
     """LLM: one experiment from the prompt (what it names wins), the code-review risks and the depmap; guard.approve
-    rejections are fed back to the LLM. Fallback: the prompt's target/fault, else the top code-review risk."""
+    rejections are fed back to the LLM. Fallback: the prompt's target/fault, else the top code-review risk.
+    Auto mode: _auto_chaos."""
+    if state.get("mode") == "auto":
+        return _auto_chaos(state)
     exp, met = agents.plan_experiment(state.get("prompt") or "", (state.get("app_model") or {}).get("risks", []),
                                       state["depmap"])
     exp["stub"] = True
@@ -226,8 +261,9 @@ def chaos_agent(state, config: RunnableConfig):
 
 
 def guard_approve(state, config: RunnableConfig):
-    """STUB: approve unless the scenario is 'rejected'."""
-    rej = "STUB: rejected by scenario" if _knob(config, "scenario", "retry") == "rejected" else None
+    """STUB: approve unless the scenario is 'rejected' (or auto mode already found nothing the guard approves)."""
+    rej = state["experiment"].get("rejection") or (
+        "STUB: rejected by scenario" if _knob(config, "scenario", "retry") == "rejected" else None)
     log("guard_approve", f"rejected: {rej}" if rej else "approved")
     return {"experiment": {**state["experiment"], "rejection": rej}}
 
@@ -503,7 +539,10 @@ def report(state, config: RunnableConfig):
     obs = (state.get("observed") or [state.get("symptoms") or {}])[0]
     sym = agents.brief(obs, state.get("baseline") or {}) if obs.get("measured") else None
     bef = state.get("symptoms") or {}
-    rpt = {**(state.get("report") or {}), "prompt": state.get("prompt"), "outcome": out, "hardening": hrd,
+    aut = state.get("auto") or {}
+    rpt = {**(state.get("report") or {}), "prompt": state.get("prompt"), "mode": state.get("mode") or "prompt",
+           "weaknesses": aut.get("weaknesses"), "auto": {key: aut.get(key) for key in ("chosen", "skipped")} if aut
+           else None, "outcome": out, "hardening": hrd,
            "experiment": exp.get("id"), "target": exp.get("target"), "attempts": state.get("attempts", 0),
            "rounds": state.get("round", 0), "comparisons": cmp, "abort": state.get("abort"),
            "stopped": state.get("stopped"), "held_s": (state.get("heal") or {}).get("held_s"),
@@ -589,16 +628,19 @@ def build(nodes=None, hold=False):
     return grf.compile()
 
 
-def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, baseline_s=30, hold=False):
+def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, baseline_s=30, hold=False, auto=False):
     """Run the graph once. Return (final_state, path) where path lists the nodes in the order they ran.
     live=True: real nodes from heal/live.py (nodes= still overrides them), real ports, baseline_s s baseline;
     injected faults are reverted and traffic stopped when the run ends, however it ends; the report is written to
-    data/heal_report.json (live only). hold=True: wait for Enter (or HOLD_S) after injection, see hold()."""
+    data/heal_report.json (live only). hold=True: wait for Enter (or HOLD_S) after injection, see hold().
+    auto=True: no prompt (must be None); the chaos agent picks a code-review weakness itself (mode "auto")."""
+    if auto and prompt is not None:
+        raise ValueError("auto mode takes no prompt")
     if scenario not in SCENARIOS:
         raise ValueError(f"scenario '{scenario}' not one of {SCENARIOS}")
     if harden not in HARDEN:
         raise ValueError(f"harden '{harden}' not one of {HARDEN}")
-    sta, pth = {"prompt": prompt, "attempts": 0}, []
+    sta, pth = {"prompt": agents.AUTO if auto else prompt, "mode": "auto" if auto else "prompt", "attempts": 0}, []
     cfg = {"configurable": {"scenario": scenario, "harden": harden, "live": live, "baseline_s": baseline_s},
            "recursion_limit": 60}
     lmd = None

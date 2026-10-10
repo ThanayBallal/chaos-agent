@@ -1,6 +1,7 @@
 """LLM agents of the heal loop (agent.llm.ask_json), each with its rule-based fallback.
 
   chaos:       plan_experiment(prompt, risks, dep)           -> (experiment, meta)
+  chaos auto:  plan_auto(weaknesses(risks, dep), dep)        -> (experiment, meta, skipped)   heal.run --auto
   diagnosis:   diagnose(brf, dep, cap=None)                  -> (diagnosis, meta)   BLIND
   remediation: remediate(dx, dep, history=None, cap=None)    -> ({"actions", "reason"}, meta)
 
@@ -214,6 +215,112 @@ def plan_experiment(prompt, risks, dep):
     exp, met = _ask("chaos_agent", CHAOS_SYS, "Choose one experiment. Data:", dat, CHAOS_SCHEMA,
                     lambda raw: check_experiment(raw, prompt, risks, dep))
     return (exp if exp else fallback_experiment(prompt, risks, dep)), met
+
+
+# ---- 1b. chaos agent, autonomous mode (heal.run --auto) ----
+
+AUTO = "auto"  # the chaos agent's prompt in autonomous mode
+AUTO_TRY = 3  # weaknesses tried, in rank order, while the guard rejects them
+
+
+def source_line(rel, num):
+    """Line num (1-based) of robot-shop file rel as read from disk, stripped; None if it cannot be read, is blank or
+    lies outside the app."""
+    from agent import code_review
+    try:
+        app = code_review.APP.resolve()
+        pth = (app / str(rel)).resolve()
+        num = int(num)
+        if num < 1 or app not in pth.parents:
+            return None
+        lns = pth.read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, ValueError, TypeError):
+        return None
+    return (lns[num - 1].strip()[:160] or None) if num <= len(lns) else None
+
+
+def weaknesses(risks, dep, top=TOP_RISKS):
+    """The ranked code-review weaknesses --auto shows and chooses from: top_risks order, at most top. "code" is the
+    cited line read from the file itself (never the review's quote); a weakness whose file:line cannot be read is
+    skipped."""
+    out = []
+    for itm in top_risks(risks, dep):
+        cod = source_line(itm.get("file"), itm.get("line"))
+        if cod is None:
+            log("weaknesses", f"skipped {itm.get('file')}:{itm.get('line')}: line cannot be read from the source")
+            continue
+        fal, tgt = itm["fault"], itm["dependency"]
+        out.append({"rank": len(out) + 1, "service": itm.get("service"), "dependency": tgt, "fault": fal,
+                    "params": dict(itm.get("params") or PRM[fal]), "file": itm["file"], "line": int(itm["line"]),
+                    "code": cod, "weakness": str(itm.get("weakness", "")).strip(),
+                    "hypothesis": str(itm.get("hypothesis") or HYP[fal].format(nam=tgt)).strip(),
+                    "weight": itm.get("weight")})
+        if len(out) == top:
+            break
+    return out
+
+
+def auto_tag(wek, num):
+    return f"Chosen autonomously: weakness #{wek['rank']} of {num} from the code review ({wek['file']}:{wek['line']}) because "
+
+
+def _auto_why(wek, skp):
+    if not skp:
+        return f"it is the top-ranked weakness (weight {wek['weight']}): {wek['weakness']}"
+    return (f"weakness{'es' if len(skp) > 1 else ''} {', '.join('#' + str(itm['rank']) for itm in skp)} "
+            f"{'were' if len(skp) > 1 else 'was'} rejected by the safety guard and it is the next-ranked: "
+            f"{wek['weakness']}")
+
+
+def auto_fallback(wek, num, skp=()):
+    """Rule-based experiment for weakness wek, with the autonomous reason."""
+    return {"id": "e1", "target": wek["dependency"], "fault": wek["fault"], "params": dict(wek["params"]),
+            "risk": "high", "rank": 1, "reason": (auto_tag(wek, num) + _auto_why(wek, skp))[:600],
+            "hypothesis": wek["hypothesis"][:600]}
+
+
+CHAOS_AUTO_SYS = f"""You are the chaos agent of a self-healing loop on the Docker Compose app "robot-shop", in autonomous mode: there is no user prompt.
+You test ONE code-review weakness, given as "weakness". target and fault are fixed: use exactly weakness.dependency and weakness.fault.
+- params must come from "faults" for that fault (exact keys, positive integers), duration_s <= {MAX_DUR}, latency delay_ms < {P95_MAX}; weakness.params is a good default.
+- reason: one sentence saying why this weakness is worth testing, citing the quoted code. Do not mention its rank (it is added for you).
+- hypothesis: a falsifiable prediction of what will be observed while the fault is active and after it is healed. Never invent measurements."""
+
+
+def check_auto(raw, wek, num, dep):
+    """Validate an autonomous LLM experiment: weakness wek's target and fault, then check_experiment's rules; the
+    reason gets the autonomous prefix."""
+    if isinstance(raw, dict) and (raw.get("target"), raw.get("fault")) != (wek["dependency"], wek["fault"]):
+        raise ValueError(f"autonomous mode tests weakness #{wek['rank']}: target must be '{wek['dependency']}' and "
+                         f"fault '{wek['fault']}'")
+    exp = check_experiment(raw, AUTO, [], dep)
+    why = re.sub(r"^(?:chosen autonomously[^:]*:\s*)?(?:because\s+)?", "", raw["reason"].strip(), flags=re.I)
+    return {**exp, "reason": (auto_tag(wek, num) + why)[:600]}
+
+
+def plan_auto(wks, dep):
+    """--auto: an experiment for the top-ranked weakness the guard approves, trying at most AUTO_TRY in rank order.
+    The guard is asked before the LLM, so a rejected weakness costs no LLM call; an LLM answer the guard rejects is
+    replaced by the rule-based one. -> (exp, meta, skipped); exp carries "rejection" if nothing could be approved."""
+    num, skp = len(wks), []
+    for wek in wks[:AUTO_TRY]:
+        exp = auto_fallback(wek, num, skp)
+        rej = guard.approve(exp, dep, mock=not ports.live())
+        if rej:
+            skp.append({"rank": wek["rank"], "where": f"{wek['file']}:{wek['line']}",
+                        "experiment": f"{wek['fault']} {wek['dependency']}", "why": f"rejected by the safety guard: {rej}"})
+            log("chaos_agent", f"auto: skipped weakness #{wek['rank']} ({wek['fault']} {wek['dependency']}): {rej}")
+            continue
+        dat = {"weakness": {key: wek[key] for key in ("service", "dependency", "fault", "params", "file", "line", "code",
+                                                       "weakness", "hypothesis")},
+               "services": services(dep), "faults": {fal: sorted(prm) for fal, prm in FAULTS.items()},
+               "max_duration_s": MAX_DUR}
+        out, met = _ask("chaos_agent", CHAOS_AUTO_SYS, "Plan the experiment for this weakness. Data:", dat, CHAOS_SCHEMA,
+                        lambda raw: check_auto(raw, wek, num, dep))
+        return (out or exp), met, skp
+    why = (f"the safety guard rejected the top {len(skp)} weaknesses" if wks
+           else "no code-review weakness could be read from the source")
+    exp = auto_fallback(wks[len(skp) - 1], num, skp[:-1]) if skp else {**DFL_EXP, "params": dict(DFL_EXP["params"])}
+    return {**exp, "rejection": f"autonomous mode: {why}"}, {"source": "fallback", "why": why}, skp
 
 
 # ---- 2. diagnosis agent (blind) ----
