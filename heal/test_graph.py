@@ -626,3 +626,109 @@ def test_no_hold_by_default():
 
 def test_cli_pause_before_heal_needs_live(capsys):
     assert cli.main(["kill redis", "--stub", "--pause-before-heal"]) == 2
+
+
+# auto mode (heal.run --auto): the chaos agent picks the top code-review weakness the guard approves
+CART = ["const redis = require('redis');", "    redisClient.setex(id, 3600, JSON.stringify(cart));", ""]
+CAT = ["        db.collection('products').find({}).toArray()"]
+
+
+def risk(svc, dep, fil, lin, fal, wgt, dur=30, quote="LLM TEXT, NOT FROM THE FILE"):
+    return {"service": svc, "dependency": dep, "file": fil, "line": lin, "quote": quote, "fault": fal,
+            "params": {"duration_s": dur, **({"delay_ms": 500} if fal == "latency" else {})}, "weight": wgt,
+            "weakness": f"{svc} has no fallback when {dep} fails", "hypothesis": f"{svc} fails while {dep} is down",
+            "fix": "add a fallback"}
+
+
+@pytest.fixture
+def reviewed(monkeypatch, tmp_path):
+    """A fake robot-shop source tree and a code review citing it: #1 cart/redis, #2 catalogue/mongodb; the top-weight
+    risk cites a missing file and one escapes the app, so both are skipped."""
+    from agent import code_review
+    for rel, lns in (("cart/server.js", CART), ("catalogue/server.js", CAT)):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("\n".join(lns), encoding="utf-8")
+    (tmp_path.parent / "outside.js").write_text("secret = 1\n", encoding="utf-8")
+    monkeypatch.setattr(code_review, "APP", tmp_path)
+    rsk = [risk("user", "mongodb", "user/missing.js", 5, "pause", 9), risk("web", "mysql", "../outside.js", 1, "kill", 8),
+           risk("cart", "redis", "cart/server.js", 2, "kill", 3), risk("catalogue", "mongodb", "catalogue/server.js", 1,
+                                                                        "pause", 2),
+           risk("cart", "redis", "cart/server.js", 3, "latency", 1)]  # blank line: skipped
+    monkeypatch.setattr(ports, "review", lambda dep: {"source": "llm", "files_read": 2, "risks": rsk})
+    return rsk
+
+
+def test_auto_with_a_prompt_is_rejected():
+    assert cli.main(["kill redis", "--auto", "--stub"]) == 2
+    assert cli.main(["--stub"]) == 2  # neither a prompt nor --auto
+    with pytest.raises(ValueError):
+        graph.run("kill redis", "healed", auto=True)
+
+
+def test_auto_picks_weakness_1_with_the_required_reason(reviewed, capsys):
+    sta, pth = graph.run(None, "healed", auto=True)
+    exp, rpt = sta["experiment"], sta["report"]
+    assert (exp["target"], exp["fault"]) == ("redis", "kill") and "inject" in pth
+    assert exp["reason"].startswith("Chosen autonomously: weakness #1 of 2 from the code review (cart/server.js:2) "
+                                    "because ")
+    assert rpt["mode"] == "auto" and rpt["auto"] == {"chosen": 1, "skipped": []}
+    out = capsys.readouterr().out
+    assert out.index("== Code review") < out.index("== Auto: chose weakness #1")
+    assert " 1. cart -> redis (kill)  cart/server.js:2" in out and " 2. catalogue -> mongodb (pause)" in out
+
+
+def test_auto_falls_back_to_weakness_2_when_1_is_rejected(reviewed, capsys):
+    reviewed[2]["params"]["duration_s"] = 90  # over the guard's 60 s limit
+    sta, pth = graph.run(None, "healed", auto=True)
+    exp, aut = sta["experiment"], sta["report"]["auto"]
+    assert (exp["target"], exp["fault"]) == ("mongodb", "pause") and "inject" in pth
+    assert exp["reason"].startswith("Chosen autonomously: weakness #2 of 2 from the code review "
+                                    "(catalogue/server.js:1) because weakness #1 was rejected by the safety guard")
+    assert aut["chosen"] == 2 and aut["skipped"][0]["rank"] == 1 and "duration 90s" in aut["skipped"][0]["why"]
+    assert "== Auto: skipped weakness #1 (kill redis, cart/server.js:2): rejected by the safety guard: duration 90s" \
+        in capsys.readouterr().out
+
+
+def test_auto_reports_rejected_when_every_weakness_is_rejected(reviewed):
+    for itm in reviewed:
+        itm["params"]["duration_s"] = 90
+    sta, pth = graph.run(None, "healed", auto=True)
+    assert pth == ["understand", "chaos_agent", "guard_approve", "report"]
+    assert sta["report"]["outcome"] == "rejected" and len(sta["report"]["auto"]["skipped"]) == 2
+
+
+def test_auto_quotes_code_from_the_file(reviewed):
+    from heal import agents
+    wks = agents.weaknesses(reviewed, graph._load("mock_depmap.json"))
+    assert [(wek["file"], wek["line"]) for wek in wks] == [("cart/server.js", 2), ("catalogue/server.js", 1)]
+    assert [wek["code"] for wek in wks] == [CART[1].strip(), CAT[0].strip()]  # the file's line, not the LLM quote
+    assert agents.source_line("../outside.js", 1) is None and agents.source_line("cart/server.js", 99) is None
+
+
+def test_auto_llm_reason_gets_the_prefix(reviewed):
+    from heal import agents
+    dep = graph._load("mock_depmap.json")
+    wek = agents.weaknesses(reviewed, dep)[0]
+    raw = {"target": "redis", "fault": "kill", "params": {"duration_s": 20}, "reason": "Because carts live only in redis.",
+           "hypothesis": "cart requests fail while redis is down"}
+    exp = agents.check_auto(raw, wek, 2, dep)
+    assert exp["reason"] == ("Chosen autonomously: weakness #1 of 2 from the code review (cart/server.js:2) because "
+                             "carts live only in redis.") and exp["params"] == {"duration_s": 20}
+    with pytest.raises(ValueError, match="weakness #1"):
+        agents.check_auto({**raw, "target": "mysql"}, wek, 2, dep)
+
+
+def test_mode_is_recorded_in_heal_report(reviewed, tmp_path):
+    out = {}
+    for mod, (prm, aut) in {"auto": (None, True), "prompt": ("kill redis", False)}.items():
+        sta, pth = graph.run(prm, "healed", auto=aut)
+        out[mod] = json.loads(graph.save_report(sta["report"], pth, tmp_path / f"{mod}.json").read_text())
+    assert out["auto"]["mode"] == "auto" and [wek["rank"] for wek in out["auto"]["weaknesses"]] == [1, 2]
+    assert out["auto"]["weaknesses"][0]["code"] == CART[1].strip()
+    assert out["prompt"]["mode"] == "prompt" and out["prompt"]["weaknesses"] is None
+
+
+def test_refresh_forces_a_new_code_review(monkeypatch):
+    monkeypatch.delenv("CHAOS_REVIEW_FRESH", raising=False)
+    import os
+    assert cli.main(["kill redis", "--stub", "--refresh"]) == 0 and os.environ["CHAOS_REVIEW_FRESH"] == "1"  # undone by monkeypatch
