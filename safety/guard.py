@@ -82,15 +82,23 @@ def check(smp, bas, tgt=None, allowed=None):
         _brc["since"] = None
     if allowed is None:
         allowed = _ctx["blast"] if tgt is not None and _ctx["target"] == tgt else {tgt}
-    bad = [svc for svc, sta in smp.get("health", {}).items() if svc not in allowed and sta == "unhealthy"]
+    bad = [f"{svc}={sta}" for svc, sta in _states(smp, bas).items() if svc not in allowed and sta != "healthy"]
     if bad:
         return f"collateral unhealthy outside blast radius: {', '.join(bad)}"
     return None
 
 
+def _states(smp, bas):
+    """Sample health plus 'missing' for every baseline service absent from the sample."""
+    hlt = dict(smp.get("health", {}))
+    for svc in bas.get("health", {}):
+        hlt.setdefault(svc, "missing")
+    return hlt
+
+
 def ready(smp, bas):
-    """Return a reason if the system is not at steady state, else None."""
-    bad = [svc for svc, sta in smp.get("health", {}).items() if sta == "unhealthy"]
+    """Return a reason if the system is not at steady state, else None. Any state but 'healthy' is bad."""
+    bad = [f"{svc}={sta}" for svc, sta in _states(smp, bas).items() if sta != "healthy"]
     if bad:
         return f"not steady: unhealthy {', '.join(bad)}"
     lim = READY_ERR_MULT * max(bas.get("error_rate", 0), READY_ERR_FLOOR)

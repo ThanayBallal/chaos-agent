@@ -1,0 +1,35 @@
+graph LR
+  service_0["mongodb (db)"]
+  service_1["redis (cache)"]
+  service_2["rabbitmq (queue)"]
+  service_3["catalogue (app)"]
+  service_4["user (app)"]
+  service_5["cart (app)"]
+  service_6["mysql (db)"]
+  service_7["shipping (app)"]
+  service_8["ratings (app)"]
+  service_9["payment (app)"]
+  service_10["dispatch (app)"]
+  service_11["web (proxy)"]
+  service_3 -->|"db"| service_0
+  service_4 -->|"db"| service_0
+  service_4 -->|"cache"| service_1
+  service_5 -->|"cache"| service_1
+  service_7 -->|"db"| service_6
+  service_8 -->|"db"| service_6
+  service_9 -->|"queue"| service_2
+  service_10 -->|"queue"| service_2
+  service_11 -->|"http"| service_3
+  service_11 -->|"http"| service_4
+  service_11 -->|"http"| service_7
+  service_11 -->|"http"| service_9
+  classDef app fill:#dbeafe,stroke:#2563eb,color:#172554
+  classDef db fill:#dcfce7,stroke:#16a34a,color:#052e16
+  classDef cache fill:#fef3c7,stroke:#d97706,color:#451a03
+  classDef queue fill:#f3e8ff,stroke:#9333ea,color:#3b0764
+  classDef proxy fill:#fee2e2,stroke:#dc2626,color:#450a0a
+  class service_3,service_4,service_5,service_7,service_8,service_9,service_10 app
+  class service_1 cache
+  class service_0,service_6 db
+  class service_11 proxy
+  class service_2 queue

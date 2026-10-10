@@ -123,6 +123,22 @@ def test_reset_keeps_blast_radius_from_approve():
     assert "ratings" in guard.check(smp(health={"ratings": "unhealthy"}), BAS, "redis")
 
 
+@pytest.mark.parametrize("sta", ["paused", "starting", "unhealthy", "exited"])
+def test_any_non_healthy_state_is_collateral(sta):
+    alw = guard.blast_radius(DEP, "redis")
+    assert f"ratings={sta}" in guard.check(smp(health={"ratings": sta}), BAS, "redis", alw)
+    assert guard.check(smp(health={"cart": sta}), BAS, "redis", alw) is None
+
+
+def test_missing_service_is_collateral():
+    bas = {**BAS, "health": {"redis": "healthy", "cart": "healthy", "ratings": "healthy"}}
+    alw = guard.blast_radius(DEP, "redis")
+    assert "ratings=missing" in guard.check(smp(health={"redis": "paused", "cart": "healthy"}), bas, "redis", alw)
+    assert guard.check(smp(health={"ratings": "healthy"}), bas, "redis", alw) is None
+    # docker failure -> empty health -> everything outside the radius is missing
+    assert "ratings=missing" in guard.check(smp(health={}), bas, "redis", alw)
+
+
 # kill switch
 def test_kill_switch():
     assert guard.check(smp(), BAS) is None
@@ -145,6 +161,17 @@ def test_ready():
     assert "unhealthy" in guard.ready(smp(health={"cart": "unhealthy"}), BAS)
     assert "error_rate" in guard.ready(smp(err=0.2), {"error_rate": 0.05})
     assert guard.ready(smp(err=0.1), {"error_rate": 0.05}) is None
+
+
+@pytest.mark.parametrize("sta", ["paused", "starting", "unhealthy", "exited"])
+def test_ready_rejects_non_healthy(sta):
+    assert f"cart={sta}" in guard.ready(smp(health={"cart": sta}), BAS)
+
+
+def test_ready_rejects_missing():
+    bas = {**BAS, "health": {"cart": "healthy", "redis": "healthy"}}
+    assert "redis=missing" in guard.ready(smp(health={"cart": "healthy"}), bas)
+    assert guard.ready(smp(health={"cart": "healthy", "redis": "healthy"}), bas) is None
 
 
 # active fault persistence
