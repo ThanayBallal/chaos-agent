@@ -19,6 +19,7 @@ Live-only ports (raise outside live mode):
   inject       -> monitor.injector.inject(exp) + guard.register(revert), inside try
   observe      -> measured symptoms; knows NOTHING about the experiment
   verify       -> guard.ready on 1 s samples until steady (runner.REC_OK in a row) + recovery timing
+states       -> {service: container status} of project robot-shop (console status lines during the hold; stub: fake)
 heal_check works in both modes: the live heal guard (deadline, kill switch, collateral; no error-rate/p95 abort).
 """
 import time
@@ -215,6 +216,20 @@ def _tail(con):
     return [lin[:LOG_W] for lin in txt.splitlines()[-LOG_N:]]
 
 
+def _containers(cli):
+    """{service: container} of project robot-shop, stopped ones included."""
+    return {con.labels.get(SVC_LBL, con.name): con
+            for con in cli.containers.list(all=True, filters={"label": f"{LBL}={PRJ}"})}
+
+
+def states():
+    """{service: container status} of project robot-shop. Console only (the hold's status line), never a symptom."""
+    if MODE["live"]:
+        from monitor import injector
+        return {svc: con.status for svc, con in _containers(injector._docker()).items()}
+    return {"web": "running", "cart": "running", "redis": "running"}
+
+
 def observe(bas):
     """Measured symptoms of the whole app, with no knowledge of the experiment: OBS_S s of traffic (error_rate, p95,
     per endpoint), docker health, container status, cpu % (live_check) and netem (fixes.has_netem) per running container, last LOG_N log lines of unhealthy services."""
@@ -225,8 +240,7 @@ def observe(bas):
     hlt = smp["health"]
     bad = sorted(svc for svc, sta in hlt.items() if sta != "healthy")
     cli = injector._docker()
-    cons = {con.labels.get(SVC_LBL, con.name): con
-            for con in cli.containers.list(all=True, filters={"label": f"{LBL}={PRJ}"})}
+    cons = _containers(cli)
     run = {svc: con for svc, con in cons.items() if con.status == "running"}
     try:
         cli.images.get(injector.NET)

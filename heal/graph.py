@@ -22,6 +22,10 @@ against the experiment afterwards (state["diagnosis_score"]). On a retry the fir
 remediation_agent gets the previous diagnosis, the actions taken and the new symptoms.
 Abort (live only: not steady, injection failed, kill switch, collateral outside the blast radius, 60 s heal deadline):
   inject / observe -> (abort) guard_revert; verify -> (abort) give_up -> guard_revert.
+Hold (run(..., hold=True), heal.run --live --pause-before-heal): inject -> hold -> observe. hold prints the broken
+  experiment on the console only (never into the state, so the blind diagnosis sees nothing of it), waits for Enter
+  or HOLD_S, prints container states every STATUS_S, and restarts the heal deadline when it ends.
+  STOP file or Ctrl+C during the hold -> (abort) guard_revert -> report.
 
 Two modes, one graph. STUB (default): the nodes below log and return plausible fake data marked "stub": True and never
 write data/*.json. LIVE (run(..., live=True)): heal/live.py replaces the measuring nodes with real ones on project
@@ -30,6 +34,9 @@ Stub knobs in config["configurable"]: scenario = retry (default) | healed | unhe
 harden = round1 (default) | round2 | never (which hardening round improves). Both are ignored in live mode.
 """
 import json
+import signal
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import TypedDict
@@ -40,6 +47,7 @@ from langgraph.graph import END, START, StateGraph
 from heal import agents, ports
 from safety import guard
 from heal.agents import HEAL, HEAL_CATALOG, HEAL_DESC, WEB, check_heal, heal_plan  # noqa: F401 (re-exported)
+from safety.allowlist import MAX_DUR
 
 DAT = Path(__file__).resolve().parent.parent / "data"
 MAX_ATTEMPTS = 2  # contracts.md: at most 2 fix attempts per run
@@ -54,6 +62,10 @@ REC_GAIN, REC_GAIN_S = 0.30, 10  # hardening: recovery_s must drop >= 30% AND >=
 REPORT = DAT / "heal_report.json"  # live runs only
 NO_FIX = "no hardening fix available for this fault"
 KILL = "kill switch (STOP file)"
+HOLD_S = 90  # hold: max seconds before healing starts on its own
+STATUS_S = 5  # hold: seconds between container-state lines
+TICK_S = 0.2  # hold: poll interval for Enter / STOP / Ctrl+C
+HEAL_S = MAX_DUR  # heal deadline, restarted when the hold ends (same as heal/live.py HEAL_S)
 
 
 class HealState(TypedDict, total=False):
@@ -226,6 +238,71 @@ def inject(state, config: RunnableConfig):
     log("inject", f"{exp['fault']} on {exp['target']} (not really)")
     return {"symptoms": {"id": exp["id"], "target": exp["target"], "fault": exp["fault"], "injected": True,
                          "stub": True}}
+
+
+def _enter():
+    """Event set when Enter is pressed (a daemon thread reads one line of stdin)."""
+    evt = threading.Event()
+
+    def wait():
+        try:
+            sys.stdin.readline()
+        except Exception:
+            return  # no usable stdin: the hold runs to HOLD_S
+        evt.set()
+    threading.Thread(target=wait, daemon=True).start()
+    return evt
+
+
+def _states():
+    try:
+        sts = ports.states()
+    except Exception as err:
+        return f"states unavailable ({type(err).__name__})"
+    return " ".join(f"{svc}={sta}" for svc, sta in sorted(sts.items())) or "no containers"
+
+
+def hold(state, config: RunnableConfig):
+    """Demo hold after injection: wait for Enter or HOLD_S with the kill switch armed (STOP file or Ctrl+C -> abort
+    -> guard_revert), printing container states every STATUS_S. The experiment is printed, never put in the state.
+    Then the heal deadline (and recovery timing) restarts from now."""
+    exp = state["experiment"]
+    print(f"BROKEN: {exp['fault']} {exp['target']} {json.dumps(exp.get('params') or {})} ({exp['id']}). Show the app. "
+          f"Press Enter to start healing (auto-continues in {HOLD_S} s)", flush=True)
+    evt, ctl, old = _enter(), threading.Event(), None
+    if threading.current_thread() is threading.main_thread():
+        old = signal.signal(signal.SIGINT, lambda sig, frm: ctl.set())  # guard's handler would exit past the report
+    t_0 = time.monotonic()
+    nxt, abr, why = t_0 + STATUS_S, None, "timeout"
+    try:
+        while True:
+            now = time.monotonic()
+            if guard.kill_switch():
+                abr = KILL
+            elif ctl.is_set():
+                abr = "Ctrl+C during the hold"
+            elif evt.is_set():
+                why = "enter"
+            elif now - t_0 < HOLD_S:
+                if now >= nxt:
+                    log("hold", f"{int(now - t_0)}s/{HOLD_S}s (STOP file or Ctrl+C reverts) | {_states()}")
+                    nxt += STATUS_S
+                time.sleep(TICK_S)
+                continue
+            break
+    finally:
+        if old is not None:
+            signal.signal(signal.SIGINT, old)
+    now = time.monotonic()
+    log("hold", f"ABORT: {abr}" if abr else f"{why} after {round(now - t_0)}s, healing starts now ({HEAL_S}s deadline)")
+    out = {"abort": abr}
+    hel = state.get("heal")
+    if hel and not abr:
+        out["heal"] = {**hel, "injected_t0": hel["t0"], "t0": now, "until": now + HEAL_S,
+                       "held_s": round(now - hel["t0"]), "held_by": why}
+    elif hel is None and not abr:
+        out["heal"] = {"held_s": round(now - t_0), "held_by": why}  # stub: no deadline to restart
+    return out
 
 
 def _stub_measured(exp, bas):
@@ -429,7 +506,8 @@ def report(state, config: RunnableConfig):
     rpt = {**(state.get("report") or {}), "prompt": state.get("prompt"), "outcome": out, "hardening": hrd,
            "experiment": exp.get("id"), "target": exp.get("target"), "attempts": state.get("attempts", 0),
            "rounds": state.get("round", 0), "comparisons": cmp, "abort": state.get("abort"),
-           "stopped": state.get("stopped"),
+           "stopped": state.get("stopped"), "held_s": (state.get("heal") or {}).get("held_s"),
+           "held_by": (state.get("heal") or {}).get("held_by"),
            "applied_fixes": state.get("applied_fixes") or [],
            "score": cmp[-1]["score"] if cmp else None, "stub": not _knob(config, "live", False),
            "experiment_detail": {key: exp.get(key) for key in ("target", "fault", "params", "reason", "hypothesis",
@@ -473,14 +551,17 @@ def save_report(rpt, pth, out=None):
 NODES = {fnc.__name__: fnc for fnc in (
     understand, chaos_agent, guard_approve, inject, observe, diagnosis_agent, remediation_agent, apply_fix, verify,
     guard_revert, harden_agent, apply_hardening, rerun, compare, revert_patch, report)}
+HOLD = {"hold": hold}  # wired in only by build(hold=True)
 
 
-def build(nodes=None):
-    """Compile the graph. nodes = {name: fn(state, config)} replaces those stubs (e.g. with real implementations)."""
-    bad = sorted(set(nodes or {}) - set(NODES))
+def build(nodes=None, hold=False):
+    """Compile the graph. nodes = {name: fn(state, config)} replaces those stubs (e.g. with real implementations).
+    hold=True puts the hold node between inject and observe."""
+    knw = {**NODES, **HOLD}
+    bad = sorted(set(nodes or {}) - set(knw))
     if bad:
-        raise ValueError(f"unknown nodes {bad}; known: {sorted(NODES)}")
-    fns = {**NODES, **(nodes or {})}
+        raise ValueError(f"unknown nodes {bad}; known: {sorted(knw)}")
+    fns = {**(knw if hold else NODES), **(nodes or {})}
     grf = StateGraph(HealState)
     for nam, fnc in fns.items():
         grf.add_node(nam, fnc)
@@ -488,7 +569,9 @@ def build(nodes=None):
     grf.add_edge("understand", "chaos_agent")
     grf.add_edge("chaos_agent", "guard_approve")
     grf.add_conditional_edges("guard_approve", route_approval, {"rejected": "report", "approved": "inject"})
-    grf.add_conditional_edges("inject", route_abort, {"abort": "guard_revert", "ok": "observe"})
+    grf.add_conditional_edges("inject", route_abort, {"abort": "guard_revert", "ok": "hold" if hold else "observe"})
+    if hold:
+        grf.add_conditional_edges("hold", route_abort, {"abort": "guard_revert", "ok": "observe"})
     grf.add_conditional_edges("observe", route_abort, {"abort": "guard_revert", "ok": "diagnosis_agent"})
     for src, dst in (("diagnosis_agent", "remediation_agent"), ("remediation_agent", "apply_fix"),
                      ("apply_fix", "verify")):
@@ -506,11 +589,11 @@ def build(nodes=None):
     return grf.compile()
 
 
-def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, baseline_s=30):
+def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, baseline_s=30, hold=False):
     """Run the graph once. Return (final_state, path) where path lists the nodes in the order they ran.
     live=True: real nodes from heal/live.py (nodes= still overrides them), real ports, baseline_s s baseline;
     injected faults are reverted and traffic stopped when the run ends, however it ends; the report is written to
-    data/heal_report.json (live only)."""
+    data/heal_report.json (live only). hold=True: wait for Enter (or HOLD_S) after injection, see hold()."""
     if scenario not in SCENARIOS:
         raise ValueError(f"scenario '{scenario}' not one of {SCENARIOS}")
     if harden not in HARDEN:
@@ -524,7 +607,7 @@ def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, basel
         ports.use_live(True)
         nodes = {**lmd.NODES, **(nodes or {})}
     try:
-        for upd in build(nodes).stream(dict(sta), config=cfg, stream_mode="updates"):
+        for upd in build(nodes, hold=hold).stream(dict(sta), config=cfg, stream_mode="updates"):
             for nam, val in upd.items():
                 pth.append(nam)
                 sta.update(val or {})

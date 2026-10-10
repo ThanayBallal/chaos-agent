@@ -546,3 +546,83 @@ def test_stop_routes(monkeypatch):
     assert route_compare({**sta, "stopped": graph.KILL}) == "done" and graph.route_harden({**sta, "stopped": "x"}) == "skip"
     monkeypatch.setattr(guard, "kill_switch", lambda: True)
     assert route_compare(sta) == "done" and graph.route_harden(sta) == "skip"
+
+
+# hold (--pause-before-heal): inject -> hold -> observe, kill switch armed during the hold
+@pytest.fixture
+def holding(monkeypatch):
+    """Short hold timings and a fake Enter: hold.set() presses it."""
+    import threading
+    monkeypatch.setattr(graph, "HOLD_S", 0.3)
+    monkeypatch.setattr(graph, "STATUS_S", 0.1)
+    monkeypatch.setattr(graph, "TICK_S", 0.01)
+    evt = threading.Event()
+    monkeypatch.setattr(graph, "_enter", lambda: evt)
+    return evt
+
+
+def after(pth, nam):
+    return pth[pth.index(nam) + 1]
+
+
+def test_hold_enter_continues_to_observe(holding, capsys):
+    holding.set()
+    sta, pth = graph.run("kill redis", "healed", hold=True)
+    assert pth[pth.index("inject"):pth.index("inject") + 4] == ["inject", "hold", "observe", "diagnosis_agent"]
+    assert sta["report"]["outcome"] == "healed" and sta["report"]["held_by"] == "enter"
+    assert "BROKEN: kill redis" in capsys.readouterr().out
+
+
+def test_stop_during_hold_goes_to_guard_revert(holding, monkeypatch, calls):
+    from safety import guard
+    monkeypatch.setattr(guard, "kill_switch", lambda: True)
+    sta, pth = graph.run("kill redis", "healed", hold=True)
+    assert pth[pth.index("inject"):] == ["inject", "hold", "guard_revert", "report"]
+    assert "observe" not in pth and calls["revert_all"]
+    assert sta["report"]["outcome"] == "aborted" and sta["report"]["abort"] == graph.KILL
+
+
+def test_hold_timeout_continues(holding, capsys):
+    sta, pth = graph.run("kill redis", "healed", hold=True)
+    assert after(pth, "hold") == "observe"
+    assert sta["report"]["held_by"] == "timeout" and sta["report"]["outcome"] == "healed"
+    assert "[heal] hold: 0s/0.3s" in capsys.readouterr().out  # status line with container states
+
+
+def test_ctrl_c_during_hold_goes_to_guard_revert(holding, monkeypatch):
+    import signal
+    import threading
+    monkeypatch.setattr(graph, "_enter", lambda: threading.Timer(0.05, signal.raise_signal, (signal.SIGINT,)).start()
+                        or holding)
+    org = signal.getsignal(signal.SIGINT)
+    sta, pth = graph.run("kill redis", "healed", hold=True)
+    assert after(pth, "hold") == "guard_revert" and sta["report"]["abort"] == "Ctrl+C during the hold"
+    assert signal.getsignal(signal.SIGINT) is org  # previous (guard) handler restored
+
+
+def test_hold_does_not_leak_the_experiment_to_diagnosis(holding, monkeypatch):
+    from heal import agents
+    org, got = agents.diagnose, []
+    monkeypatch.setattr(agents, "diagnose", lambda *arg, **kw: got.append((arg, kw)) or org(*arg, **kw))
+    graph.run("kill redis", "healed")
+    holding.set()
+    graph.run("kill redis", "healed", hold=True)
+    assert len(got) == 2 and got[0] == got[1]
+
+
+def test_hold_restarts_the_heal_deadline(holding):
+    import time
+    holding.set()
+    out = graph.hold({"experiment": {"id": "e1", "fault": "kill", "target": "redis", "params": {}},
+                      "heal": {"t0": 0.0, "until": 60.0, "injected": True}}, {})
+    hel = out["heal"]
+    assert out["abort"] is None and hel["injected_t0"] == 0.0 and hel["injected"]
+    assert abs(hel["until"] - (time.monotonic() + graph.HEAL_S)) < 1 and hel["until"] - hel["t0"] == graph.HEAL_S
+
+
+def test_no_hold_by_default():
+    assert "hold" not in graph.run("kill redis", "healed")[1]
+
+
+def test_cli_pause_before_heal_needs_live(capsys):
+    assert cli.main(["kill redis", "--stub", "--pause-before-heal"]) == 2

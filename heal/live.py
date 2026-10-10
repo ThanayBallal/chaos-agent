@@ -4,7 +4,8 @@ graph.run(..., live=True) puts NODES in place of the stubs of the same name and 
 chaos_agent, remediation_agent and the blind half of diagnosis_agent are the shared LLM agents (heal/agents.py, rule
 fallbacks); harden_agent, apply_hardening, compare and revert_patch stay shared too.
 Safety while healing: guard.approve (allowlist, depmap, live container), guard.ready before every injection, then
-ports.heal_check: kill switch, collateral outside the blast radius, and a hard HEAL_S deadline from injection.
+ports.heal_check: kill switch, collateral outside the blast radius, and a hard HEAL_S deadline from injection (with
+--pause-before-heal: from the end of graph.hold, which also moves heal["t0"], so recovery_s counts from there).
 The error-rate and p95 aborts are off while healing (they are the symptoms being healed).
 Results and evidence are measured only; a field that was not measured is None.
 """

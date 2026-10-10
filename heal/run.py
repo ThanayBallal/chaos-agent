@@ -1,6 +1,8 @@
 """Run the heal graph:
 python -m heal.run "prompt" --stub [--scenario retry|healed|unhealed|rejected] [--harden round1|round2|never]
-python -m heal.run "prompt" --live [--baseline-s 30]   (real robot-shop; STOP file or Ctrl+C reverts everything)"""
+python -m heal.run "prompt" --live [--baseline-s 30] [--pause-before-heal]
+    (real robot-shop; STOP file or Ctrl+C reverts everything; --pause-before-heal holds the broken app after injection
+    until Enter or 90 s, then heals with a fresh 60 s deadline)"""
 import argparse
 import json
 import sys
@@ -28,6 +30,8 @@ def show(rpt):
               f"(service {'ok' if scr.get('service') else 'wrong'}, fault {'ok' if scr.get('fault') else 'wrong'})")
         for itm in dxs["evidence"]:
             print(f"   evidence: {itm}")
+    if rpt.get("held_s") is not None:
+        print(f"== Held for {rpt['held_s']}s before healing ({rpt.get('held_by')})")
     for itm in rpt.get("applied_fixes", []):
         print(f"== Action attempt {itm['attempt']}: {itm['action']}({itm['target']}) ok={itm['ok']} {itm['detail']}")
     if rpt.get("outcome") == "healed" or (rpt.get("outcome") == "stopped_by_kill_switch" and rpt.get("healed")):
@@ -79,6 +83,8 @@ def main(argv=None):
     arg.add_argument("--scenario", default="retry", choices=graph.SCENARIOS, help="stub heal outcome")
     arg.add_argument("--harden", default="round1", choices=graph.HARDEN, help="stub: which hardening round improves")
     arg.add_argument("--baseline-s", type=int, default=30, help="live: seconds of baseline traffic to capture")
+    arg.add_argument("--pause-before-heal", action="store_true",
+                     help="live: after injection wait for Enter (or 90 s) before healing, kill switch armed")
     try:
         opt = arg.parse_args(argv)
     except SystemExit as err:
@@ -86,10 +92,13 @@ def main(argv=None):
     if not (opt.stub or opt.live):
         print("choose --stub or --live", file=sys.stderr)
         return 2
+    if opt.pause_before_heal and not opt.live:
+        print("--pause-before-heal needs --live", file=sys.stderr)
+        return 2
     if opt.live:
         from safety import guard
         guard.install()  # stale STOP removed; Ctrl+C and exit revert every registered fault
-        sta, pth = graph.run(opt.prompt, live=True, baseline_s=opt.baseline_s)
+        sta, pth = graph.run(opt.prompt, live=True, baseline_s=opt.baseline_s, hold=opt.pause_before_heal)
     else:
         sta, pth = graph.run(opt.prompt, opt.scenario, harden=opt.harden)
     rpt = sta.get("report", {})
