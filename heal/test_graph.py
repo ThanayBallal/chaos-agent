@@ -277,3 +277,138 @@ def test_cli_harden_round2(capsys):
 
 def test_cli_requires_stub():
     assert cli.main(["kill redis"]) == 2
+
+
+def test_cli_rejects_stub_and_live():
+    assert cli.main(["kill redis", "--stub", "--live"]) == 2
+
+
+# abort routing (live guard: deadline, kill switch, collateral, failed inject)
+def test_route_abort():
+    assert graph.route_abort({"abort": "heal deadline reached"}) == "abort"
+    assert graph.route_abort({"abort": None}) == graph.route_abort({}) == "ok"
+
+
+def test_verify_abort_gives_up_unless_healed():
+    assert route_verify({"verify": {"healed": False}, "attempts": 1, "abort": "kill switch"}) == "give_up"
+    assert route_verify({"verify": {"healed": True}, "attempts": 1, "abort": "late"}) == "healed"
+
+
+@pytest.mark.parametrize("nod,tail", [("inject", ["inject", "guard_revert", "report"]),
+                                      ("observe", ["inject", "observe", "guard_revert", "report"])])
+def test_abort_goes_to_guard_revert(nod, tail, calls):
+    sta, pth = graph.run("p", "healed", nodes={nod: lambda state: {"abort": "kill switch (STOP file)"}})
+    assert pth[-len(tail):] == tail and "apply_fix" not in pth and not calls["heal_fix"]
+    assert sta["report"]["outcome"] == "aborted" and sta["report"]["abort"] == "kill switch (STOP file)"
+    assert calls["revert_all"] == [((), {})]
+
+
+def test_verify_abort_skips_the_retry(calls):
+    stop = lambda state: {"verify": {"healed": False}, "abort": "heal deadline reached"}  # noqa: E731
+    sta, pth = graph.run("p", "retry", nodes={"verify": stop})
+    assert pth.count("apply_fix") == 1 and pth[-3:] == ["verify", "guard_revert", "report"]
+    assert sta["report"]["outcome"] == "aborted"
+
+
+def test_applied_fixes_keep_heal_results():
+    sta, _ = graph.run("p", "healed")
+    assert sta["applied_fixes"][0] == {"action": "start_service", "target": "redis", "attempt": 1, "ok": True,
+                                       "detail": "stub"}
+    assert sta["report"]["stub"] is True and sta["report"]["applied_fixes"] == sta["applied_fixes"]
+
+
+# ports: live mode adaptations (real modules monkeypatched, no Docker)
+@pytest.fixture
+def live(monkeypatch, tmp_path):
+    from safety import guard
+    monkeypatch.setattr(guard, "ACT", tmp_path / "active_faults.json")  # guard.register must not write data/
+    monkeypatch.setattr(guard, "_rev", [])
+    ports.use_live(True)
+    yield
+    ports.use_live(False)
+    ports._faults.clear()
+
+
+@pytest.mark.parametrize("nam,arg", [("approve", ({}, {})), ("inject", ({},)), ("observe", ({},)),
+                                     ("verify", ({}, 0, 0))])
+def test_live_only_ports_refuse_stub_mode(nam, arg):
+    with pytest.raises(RuntimeError, match="live-only"):
+        getattr(ports, nam)(*arg)
+
+
+def test_live_make_maps_exclude_and_never_saves(live, monkeypatch):
+    from agent import patcher
+    got = []
+    monkeypatch.setattr(patcher, "make", lambda *arg, **kw: got.append((arg, kw)) or {"patches": []})
+    ports.make({"findings": []}, [], {}, rsl=[{"id": "e1"}])
+    ports.make({"findings": []}, [], {}, exclude=[{"fix": "redis_aof", "service": "redis"}])
+    assert got[0][1] == {"rsl": [{"id": "e1"}], "exclude": (), "save": False}
+    assert got[1][1]["exclude"] == [{"fix": "redis_aof", "service": "redis"}] and got[1][1]["save"] is False
+
+
+PATCH = {"id": "p1", "experiment": "e1", "service": "redis", "fix": "redis_aof", "reason": "r", "expected": "e"}
+
+
+def test_live_apply_strips_keys_skips_empty_and_feeds_compare(live, monkeypatch):
+    from setup import patch
+    got = []
+    monkeypatch.setattr(patch, "apply", got.append)
+    ports.apply({"patches": [], "code_suggestions": [], "stub": True})
+    assert got == []  # setup.patch.apply refuses an empty patch list
+    ports.apply({"patches": [PATCH], "code_suggestions": [], "stub": True})
+    assert got == [{"patches": [PATCH], "code_suggestions": []}]
+    res = {"id": "e1", "target": "redis", "fault": "kill", "error_rate": 0.6, "data_survived": False}
+    cmp = ports.compare([res], [{**res, "data_survived": True}], {"resilience_score": 50}, {"resilience_score": 80})
+    assert cmp["patch_ids"] == ["p1"] and cmp["experiments"][0]["improved"] is True and "stub" not in cmp
+
+
+def test_live_revert_all_reverts_faults_not_patches(live, monkeypatch):
+    from monitor import injector
+    from safety import guard
+    ran = []
+    flt, pat = lambda: ran.append("fault"), lambda: ran.append("patch")  # noqa: E731
+    flt.info = "fake"
+    monkeypatch.setattr(injector, "inject", lambda exp: flt)
+    guard.register(pat, info={"fix": "redis_aof"})  # what setup.patch.apply does
+    assert ports.inject({"id": "e1", "target": "redis", "fault": "kill"}) == {"injected": True, "info": "fake"}
+    assert [itm[0] for itm in guard._rev] == [pat, flt]
+    ports.revert_all()
+    assert ran == ["fault"] and [itm[0] for itm in guard._rev] == [pat]
+
+
+def test_live_inject_failure_reverts_and_reports(live, monkeypatch):
+    from monitor import injector
+    from safety import guard
+    ran = []
+    monkeypatch.setattr(injector, "inject", lambda exp: lambda: ran.append("revert"))
+    monkeypatch.setattr(guard, "register", lambda fnc, info=None: (_ for _ in ()).throw(OSError("disk full")))
+    out = ports.inject({"id": "e1", "target": "redis", "fault": "kill"})
+    assert out == {"injected": False, "error": "OSError: disk full"} and ran == ["revert"] and not ports._faults
+
+
+def test_heal_check_ignores_error_rate_but_not_deadline_or_collateral(monkeypatch):
+    import time
+    from safety import guard
+    monkeypatch.setattr(guard, "kill_switch", lambda: False)
+    dep = graph._load("mock_depmap.json")
+    assert guard.approve({"target": "redis", "fault": "kill", "params": {"duration_s": 10}}, dep, mock=True) is None
+    bas = {"health": {svc["name"]: "healthy" for svc in dep["services"]}}
+    smp = {"error_rate": 1.0, "p95_ms": 60000, "health": {**bas["health"], "redis": "unhealthy"}}
+    far = time.monotonic() + 60
+    assert ports.heal_check(smp, bas, "redis", far) is None  # inside the blast radius, error/p95 aborts off
+    assert ports.heal_check(smp, bas, "redis", time.monotonic() - 1) == "heal deadline reached"
+    out = [svc for svc in bas["health"] if svc not in guard.blast_radius(dep, "redis")][0]
+    assert "collateral" in ports.heal_check({"health": {**smp["health"], out: "unhealthy"}}, bas, "redis", far)
+    monkeypatch.setattr(guard, "kill_switch", lambda: True)
+    assert "kill switch" in ports.heal_check(smp, bas, "redis", far)
+
+
+# real hardening modules accept exactly what the ports pass them
+def test_real_hardening_signatures_bind_port_arguments():
+    from agent import patcher
+    from monitor import compare as cmp_mod
+    from setup import patch
+    inspect.signature(patcher.make).bind({}, [], {}, rsl=[], exclude=(), save=False)
+    inspect.signature(patch.apply).bind({})
+    inspect.signature(patch.revert).bind()
+    inspect.signature(cmp_mod.compare).bind([], [], {}, {}, pat=None)
