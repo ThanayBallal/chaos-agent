@@ -4,6 +4,7 @@ Run: python -m unittest monitor.test_monitor -v"""
 import json
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,7 +17,7 @@ RES_KEYS = {"id", "target", "fault", "started_at", "ended_at", "error_rate", "p9
 BAS = {"window_s": 2, "requests": 100, "error_rate": 0.0, "p50_ms": 5, "p95_ms": 10,
        "health": {"redis": "healthy", "cart": "healthy"}, "captured_at": "TEST"}
 EXP = {"id": "e1", "target": "redis", "fault": "kill", "params": {"duration_s": 3}}
-SHOP = {"redis": "healthy", "cart": "healthy"}
+SHOP = {"redis": "healthy", "cart": "healthy", "hang": False}
 
 
 class Shop(BaseHTTPRequestHandler):
@@ -24,13 +25,18 @@ class Shop(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, body):
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(body).encode())
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client already timed out
 
     def do_GET(self):
         if self.path.startswith("/api/cart/add"):
+            if SHOP["hang"] and SHOP["redis"] != "healthy":
+                time.sleep(3)  # like real cart with redis gone: no answer
             return self._send(200 if SHOP["redis"] == "healthy" else 500, {})
         self._send(200, [{"sku": "Watson"}])
 
@@ -110,20 +116,21 @@ class RunnerSafety(unittest.TestCase):
         cls.url, cls.hlth, cls.inj = baseline.URL, baseline.health, injector.inject
         cls.out, cls.rmax = runner.OUT, runner.REC_MAX
         baseline.URL = f"http://127.0.0.1:{cls.srv.server_port}"
-        baseline.health = lambda: dict(SHOP)
+        baseline.health = lambda: {svc: SHOP[svc] for svc in ("redis", "cart")}
         cls.tmp = tempfile.TemporaryDirectory()
         runner.OUT = Path(cls.tmp.name) / "results" / "result.json"
         runner.REC_MAX = 10
 
     @classmethod
     def tearDownClass(cls):
+        baseline.stop()
         cls.srv.shutdown()
         baseline.URL, baseline.health, injector.inject = cls.url, cls.hlth, cls.inj
         runner.OUT, runner.REC_MAX = cls.out, cls.rmax
         cls.tmp.cleanup()
 
     def setUp(self):
-        SHOP.update(redis="healthy", cart="healthy")
+        SHOP.update(redis="healthy", cart="healthy", hang=False)
         guard.STP.unlink(missing_ok=True)
         guard.revert_all()
         guard.reset() if hasattr(guard, "reset") else guard._brc.update(since=None)
@@ -195,6 +202,30 @@ class RunnerSafety(unittest.TestCase):
         self.assertIn("unregister", grd.calls)
         self.assertEqual(grd.reg[0][1]["target"], "redis")
         self.assertEqual(flt.reverts, 1)
+
+    def test_hanging_endpoint_keeps_1s_cadence(self):
+        """Real kill-redis showed cart requests hanging; sampling must stay at ~1 s and other endpoints keep traffic."""
+        tmo, baseline.TMO = baseline.TMO, 1.5
+        SHOP["hang"] = True
+        ts = []
+
+        class Rec(AbortAt2s):
+            def check(self, smp, bas, tgt=None):
+                ts.append(smp["t"])
+                return None
+
+        injector.inject = Fault()
+        try:
+            res = runner.run({**EXP, "params": {"duration_s": 4}}, BAS, Rec())
+        finally:
+            baseline.TMO = tmo
+        self._contract(res)
+        print("\n" + "\n".join(res["observations"]))
+        self.assertEqual(ts, [1, 2, 3, 4])
+        obs = {o.split(":")[0]: o for o in res["observations"]}
+        self.assertIn("timed out", obs["cart_add"])
+        self.assertIn("no errors", obs["catalogue"])
+        self.assertGreater(int(obs["catalogue"].split("/")[1].split()[0]), 20)
 
     def test_revert_is_idempotent_with_guard(self):
         flt = Fault()

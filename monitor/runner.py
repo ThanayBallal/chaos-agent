@@ -59,17 +59,23 @@ def _observe(smps, agg, bas, tgt, abr, rec, rnm, err):
     obs.append(f"error_rate {bas['error_rate']} baseline -> {agg['error_rate']} during fault "
                f"({agg['errors']}/{agg['requests']} requests failed)")
     obs.append(f"p95 {bas['p95_ms']}ms baseline -> {agg['p95_ms']}ms during fault")
+    obs.append(f"{len(smps)} samples, last at t={smps[-1]['t']}s")
     for nam, eps in agg["endpoints"].items():
         fst = next((s["t"] for s in smps if s["endpoints"][nam]["errors"]), None)
-        txt = f"{nam}: {eps['errors']}/{eps['requests']} errors, p95 {eps['p95_ms']}ms"
-        obs.append(txt + (f", first error at t={fst}s" if fst is not None else ", no errors"))
+        txt = f"{nam}: {eps['errors']}/{eps['requests']} failed"
+        if eps["timeouts"]:
+            txt += f" ({eps['timeouts']} timed out: no response within {baseline.TMO:g}s)"
+        if eps["pending"]:
+            txt += f", {eps['pending']} still waiting for a response when the fault ended"
+        txt += f", p95 {eps['p95_ms']}ms"
+        obs.append(txt + (f", first error in sample ending t={fst}s" if fst is not None else ", no errors"))
     seen = {}
     for smp in smps:
         for svc, sta in smp["health"].items():
             if sta != "healthy" and svc not in seen:
                 seen[svc] = (sta, smp["t"])
     for svc, (sta, t) in seen.items():
-        obs.append(f"{svc} {sta} at t={t}s" + (" (target)" if svc == tgt else ""))
+        obs.append(f"{svc} first seen {sta} in sample ending t={t}s" + (" (target)" if svc == tgt else ""))
     if abr:
         obs.append(f"aborted at t={smps[-1]['t']}s: {abr}")
     if err:
@@ -102,7 +108,7 @@ def run(exp, bas, grd):
     -> revert on timeout or abort -> measure recovery_s -> return dict matching result.json."""
     tgt, dur = exp["target"], exp["params"]["duration_s"]
     sta = _now()
-    smps, raw, abr, err, rec, rnm, rev = [], [], None, None, None, None, None
+    smps, raw, pen, abr, err, rec, rnm, rev = [], [], [], None, None, None, None, None
     if hasattr(grd, "reset"):
         grd.reset()
     pre = baseline.sample(1.0)
@@ -122,6 +128,7 @@ def run(exp, bas, grd):
                 smp = baseline.sample(1.0)
                 smp["t"] = round(time.monotonic() - t0)
                 raw += smp.pop("_raw")
+                pen = smp.pop("_pending")
                 smps.append(smp)
                 abr = grd.check(smp, bas, tgt)
                 if abr:
@@ -134,7 +141,7 @@ def run(exp, bas, grd):
             except Exception as exc:
                 err = f"revert failed: {type(exc).__name__}: {exc}"
         rec, rnm = _recover(bas, tgt, grd)
-    agg = baseline.stats(raw)
+    agg = baseline.stats(raw + pen)  # requests still unanswered when the fault ended count as pending
     res = {"id": exp["id"], "target": tgt, "fault": exp["fault"], "started_at": sta, "ended_at": _now(),
            "error_rate": agg["error_rate"] if raw else None, "p95_ms": agg["p95_ms"] if raw else None,
            "recovery_s": rec, "aborted": bool(abr or err), "abort_reason": abr or err,
@@ -168,6 +175,7 @@ def main():
     print(f"running {fal} on {tgt} for {dur}s...")
     res = run(exp, bas, guard)
     guard.revert_all()
+    baseline.stop()
     print(json.dumps(res, indent=2))
     print(f"saved {OUT}")
 
