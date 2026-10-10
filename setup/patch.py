@@ -28,6 +28,8 @@ STATE_FIELDS = {
     "undo_action", "status",
 }
 UNDO_ACTIONS = {"redis_aof": "redis_aof_disable", "restart_policy": "restart_policy_no"}
+REDIS_ON = (("appendonly", "yes"), ("save", "1 1"))  # snapshot to /data/dump.rdb within 1 s of a change
+REDIS_OFF = (("appendonly", "no"), ("save", "3600 1 300 100 60 10000"))  # redis 6.2 defaults
 FIXES = frozenset(UNDO_ACTIONS)
 
 
@@ -227,14 +229,11 @@ def _find_recorded_container(client: Any, record: dict[str, str]):
     return container
 
 
-def _redis_command(container: Any, enabled: bool) -> None:
-    value = "yes" if enabled else "no"
-    if getattr(container, "status", None) != "running":
-        raise PatchError(f"Redis container {container.name} is not running")
+def _redis_config(container: Any, key: str, value: str) -> None:
     try:
-        result = container.exec_run(["redis-cli", "CONFIG", "SET", "appendonly", value])
+        result = container.exec_run(["redis-cli", "CONFIG", "SET", key, value])
     except Exception as err:
-        raise PatchError(f"Redis CONFIG SET appendonly {value} failed: {err}") from err
+        raise PatchError(f"Redis CONFIG SET {key} {value} failed: {err}") from err
     if isinstance(result, tuple):
         exit_code, output = result
     else:
@@ -244,8 +243,30 @@ def _redis_command(container: Any, enabled: bool) -> None:
     message = str(output).strip()
     if exit_code != 0 or message != "OK":
         raise PatchError(
-            f"Redis CONFIG SET appendonly {value} returned exit {exit_code}: {message or '<no output>'}"
+            f"Redis CONFIG SET {key} {value} returned exit {exit_code}: {message or '<no output>'}"
         )
+
+
+def _redis_command(container: Any, enabled: bool) -> None:
+    """redis_aof on: AOF plus an RDB snapshot within a second of any change; off: back to the defaults.
+    A runtime CONFIG SET is lost when redis restarts after a crash, so it reboots with appendonly off and ignores
+    the AOF; the RDB snapshot (/data/dump.rdb) is always loaded at startup, which is what makes data survive."""
+    if getattr(container, "status", None) != "running":
+        raise PatchError(f"Redis container {container.name} is not running")
+    settings = REDIS_ON if enabled else REDIS_OFF
+    done = 0
+    try:
+        for key, value in settings:
+            _redis_config(container, key, value)
+            done += 1
+    except PatchError as err:
+        if enabled and done:  # do not leave a half-applied fix behind: the caller drops the record
+            try:
+                for key, value in REDIS_OFF[:done]:
+                    _redis_config(container, key, value)
+            except PatchError as undo_err:
+                raise PatchError(f"{err}; rolling back the partial redis_aof also failed: {undo_err}") from err
+        raise
 
 
 def _restart_policy(container: Any, policy: str) -> None:
