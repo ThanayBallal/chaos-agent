@@ -25,10 +25,10 @@ DAT = Path(__file__).resolve().parent.parent / "data"
 
 _cli = {"docker": None}
 _sku = {"val": None}
-_lod = {"ths": [], "stop": None, "pools": []}
+_lod = {"ths": [], "stop": None, "pools": [], "gen": 0}  # gen: results from a stopped generation are ignored
 _lck = threading.Lock()
 _done = []  # (endpoint, ok, ms, kind, t_end, t_start)
-_wait = {}  # token -> (endpoint, t_start)
+_wait = {}  # token -> (endpoint, t_start, gen)
 _tok = itertools.count()
 _drop = {nam: 0 for nam in EPS}  # requests not sent because CAP was reached
 _fly = {nam: 0 for nam in EPS}
@@ -91,14 +91,14 @@ def _hit(ses, nam, wid):
     return ok, "ok" if ok else f"http_{rsp.status_code}"
 
 
-def _one(nam):
-    """Send one request on a pool thread and record it."""
+def _one(nam, gen):
+    """Send one request on a pool thread and record it (unless traffic was stopped meanwhile)."""
     if not hasattr(_ses, "s"):
         _ses.s = requests.Session()
     tok, sta = next(_tok), time.monotonic()
     ok, kind = False, "client_error"
     with _lck:
-        _wait[tok] = (nam, sta)
+        _wait[tok] = (nam, sta, gen)
     try:
         ok, kind = _hit(_ses.s, nam, threading.get_ident() % 8)
     finally:
@@ -107,10 +107,11 @@ def _one(nam):
             _wait.pop(tok, None)
             _fly[nam] -= 1
     with _lck:
-        _done.append((nam, ok, (end - sta) * 1000, kind, end, sta))
+        if gen == _lod["gen"]:
+            _done.append((nam, ok, (end - sta) * 1000, kind, end, sta))
 
 
-def _schedule(nam, pool, stp):
+def _schedule(nam, pool, stp, gen):
     """Submit RATE requests per second for endpoint nam until stopped."""
     nxt = time.monotonic()
     while not stp.is_set():
@@ -122,7 +123,7 @@ def _schedule(nam, pool, stp):
             with _lck:
                 _drop[nam] += 1
         else:
-            pool.submit(_one, nam)
+            pool.submit(_one, nam, gen)
         nxt += 1 / RATE
         stp.wait(max(0.0, nxt - time.monotonic()))
 
@@ -133,7 +134,9 @@ def start():
         return
     stp = threading.Event()
     pools = [ThreadPoolExecutor(max_workers=CAP, thread_name_prefix=f"load-{nam}") for nam in EPS]
-    ths = [threading.Thread(target=_schedule, args=(nam, pool, stp), daemon=True) for nam, pool in zip(EPS, pools)]
+    gen = _lod["gen"]
+    ths = [threading.Thread(target=_schedule, args=(nam, pool, stp, gen), daemon=True)
+           for nam, pool in zip(EPS, pools)]
     for thd in ths:
         thd.start()
     _lod.update(ths=ths, stop=stp, pools=pools)
@@ -145,7 +148,10 @@ def stop():
         _lod["stop"].set()
     for pool in _lod["pools"]:
         pool.shutdown(wait=False, cancel_futures=True)
-    _lod.update(ths=[], stop=None, pools=[])
+    with _lck:
+        _lod.update(ths=[], stop=None, pools=[], gen=_lod["gen"] + 1)
+        _done.clear()
+        _drop.update({nam: 0 for nam in EPS})
 
 
 def _window(dur):
@@ -158,7 +164,7 @@ def _window(dur):
         don = [row[:4] for row in _done if t_a <= row[4] < t_b]
         don += [(nam, None, 0, "dropped") for nam in EPS for _ in range(_drop[nam])]
         _drop.update({nam: 0 for nam in EPS})
-        pen = [(nam, None, (t_b - sta) * 1000, "pending") for nam, sta in _wait.values()]
+        pen = [(nam, None, (t_b - sta) * 1000, "pending") for nam, sta, gen in _wait.values() if gen == _lod["gen"]]
         _done[:] = [row for row in _done if row[4] >= t_b - KEEP]
     return don, pen
 
@@ -168,7 +174,8 @@ def sent_between(t_a, t_b):
     now = time.monotonic()
     with _lck:
         don = [row[:4] for row in _done if t_a <= row[5] < t_b]
-        pen = [(nam, None, (now - sta) * 1000, "pending") for nam, sta in _wait.values() if t_a <= sta < t_b]
+        pen = [(nam, None, (now - sta) * 1000, "pending") for nam, sta, gen in _wait.values()
+               if t_a <= sta < t_b and gen == _lod["gen"]]
     return don + pen
 
 

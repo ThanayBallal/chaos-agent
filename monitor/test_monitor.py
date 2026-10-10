@@ -130,6 +130,7 @@ class RunnerSafety(unittest.TestCase):
         cls.tmp.cleanup()
 
     def setUp(self):
+        baseline.stop()  # fresh traffic generation: nothing from the previous test leaks in
         SHOP.update(redis="healthy", cart="healthy", hang=False)
         guard.STP.unlink(missing_ok=True)
         guard.revert_all()
