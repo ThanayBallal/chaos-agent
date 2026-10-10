@@ -9,3 +9,7 @@ data/baseline.json
 data/plan.json
 data/results/
 data/findings.json
+data/code_review.json
+data/patch.json
+data/applied_fixes.json
+data/heal_report.json

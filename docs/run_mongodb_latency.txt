@@ -1,0 +1,33 @@
+[heal] understand: capturing 30s baseline under load...
+[code-review] reusing cached LLM review of 28 files (3 risks)
+[code-review] + 1 state-loss weakness(es) from the static scan: cart/server.js:379
+[heal] understand: baseline error_rate=0.0 p95=56ms; code review source=llm risks=4
+[heal] chaos_agent: [llm] latency catalogue {'delay_ms': 2000, 'duration_s': 10}: The user requested to "slow down the database behind the catalogue" and the prompt names service catalogue with fault la
+[heal] guard_approve: approved
+[heal] inject: latency on catalogue: tc netem delay 2000ms on eth0
+[heal.ports] observe: error_rate=0.0 p95=3022ms unhealthy=none
+[heal] observe: attempt 0: error_rate=0.0 p95=3022ms
+[heal] diagnosis_agent: [llm] latency on catalogue: netem flagged for catalogue; p95_ms rose from 56ms to 3022ms (confidence 0.95, correct=True)
+[heal] remediation_agent: [llm] remove_latency(catalogue)
+[heal.ports] heal_fix: remove_latency(catalogue) ok=True: deleted root qdisc; no netem on eth0
+[heal] apply_fix: attempt 1: remove_latency ok=True
+[heal.ports] verify: steady after 30s (4 samples)
+[heal] verify: attempt 1: healed, recovery 30s
+[patcher] 0 live patches (none), 0 code suggestions (template)
+[heal] harden_agent: round 1: 
+[heal.ports] apply: no patches to apply
+[heal] apply_hardening: round 1: applied nothing
+[heal.ports] observe: error_rate=0.0 p95=3290ms unhealthy=none
+[heal.ports] heal_fix: remove_latency(catalogue) ok=True: deleted root qdisc; no netem on eth0
+[heal.ports] verify: steady after 18s (5 samples)
+[heal.ports] revert_all: 2 injected fault(s) reverted
+[heal] rerun: round 1: error_rate=0.0 recovery=18s data_survived=True
+[heal] compare: round 1: improved=True
+[heal] guard_revert: reverted fault e1 latency on catalogue
+[heal] report: outcome=healed hardening=improved_round1 attempts=1 rounds=1
+== Path ==
+understand -> chaos_agent -> guard_approve -> inject -> observe -> diagnosis_agent -> remediation_agent -> apply_fix -> verify -> harden_agent -> apply_hardening -> rerun -> compare -> guard_revert -> report
+== Report: outcome=healed hardening=improved_round1 attempts=1 rounds=1 experiment=e1 target=catalogue score={'before': 98, 'after': 98} ==
+== Prompt: 'slow down the database behind the catalogue'
+== Experiment: latency catalogue {"delay_ms": 2000, "duration_s": 10}
+   reason: The user requested to "slow down the database behind the catalogue" and the prompt names service catalogue with fault latency. Applying a latency fault to the catalogue service will delay its outbound calls to MongoDB, effectively slowing the database interactions as described.

@@ -1,0 +1,32 @@
+[heal] understand: capturing 30s baseline under load...
+[code-review] reusing cached LLM review of 28 files (3 risks)
+[code-review] + 1 state-loss weakness(es) from the static scan: cart/server.js:379
+[heal] understand: baseline error_rate=0.0 p95=57ms; code review source=llm risks=4
+[heal] chaos_agent: [llm] pause ratings {'duration_s': 10}: The user explicitly requested to freeze (pause) the ratings service. This experiment will pause the ratings container fo
+[heal] guard_approve: approved
+[heal] inject: pause on ratings: docker pause (SIGSTOP via freezer cgroup)
+[heal.ports] observe: error_rate=0.0 p95=57ms unhealthy=['ratings']
+[heal] observe: attempt 0: error_rate=0.0 p95=57ms
+[heal] diagnosis_agent: [llm] pause on ratings: containers_not_running shows ratings is paused; unhealthy maps ratings to paused (confidence 0.95, correct=True)
+[heal] remediation_agent: [llm] unpause_service(ratings)
+[heal.ports] heal_fix: unpause_service(ratings) ok=True: unpaused, now running
+[heal] apply_fix: attempt 1: unpause_service ok=True
+[heal.ports] verify: steady after 33s (11 samples)
+[heal] verify: attempt 1: healed, recovery 33s
+[patcher] 0 live patches (none), 0 code suggestions (template)
+[heal] harden_agent: round 1: 
+[heal.ports] apply: no patches to apply
+[heal] apply_hardening: round 1: applied nothing
+[heal.ports] observe: error_rate=0.0 p95=57ms unhealthy=['ratings']
+[heal.ports] heal_fix: unpause_service(ratings) ok=True: unpaused, now running
+[heal.ports] verify: steady after 22s (11 samples)
+[heal.ports] revert_all: 2 injected fault(s) reverted
+[heal] rerun: round 1: error_rate=0.0 recovery=22s data_survived=True
+[heal] compare: round 1: improved=True
+[heal] guard_revert: reverted fault e1 pause on ratings
+[heal] report: outcome=healed hardening=improved_round1 attempts=1 rounds=1
+== Path ==
+understand -> chaos_agent -> guard_approve -> inject -> observe -> diagnosis_agent -> remediation_agent -> apply_fix -> verify -> harden_agent -> apply_hardening -> rerun -> compare -> guard_revert -> report
+== Report: outcome=healed hardening=improved_round1 attempts=1 rounds=1 experiment=e1 target=ratings score={'before': 98, 'after': 98} ==
+== Prompt: 'freeze the ratings service'
+== Experiment: pause ratings {"duration_s": 10}

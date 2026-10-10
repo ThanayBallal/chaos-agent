@@ -1,0 +1,35 @@
+[heal] understand: capturing 30s baseline under load...
+[code-review] reusing cached LLM review of 28 files (3 risks)
+[code-review] + 1 state-loss weakness(es) from the static scan: cart/server.js:379
+[heal] understand: baseline error_rate=0.0 p95=57ms; code review source=llm risks=4
+[heal] chaos_agent: [llm] kill cart {'duration_s': 10}: The user specifically requested to "kill the cache that cart uses".  The prompt names the service `cart` and the fault `
+[heal] guard_approve: approved
+[heal] inject: kill on cart: crash: SIGKILL to main process (restart policy applies)
+[heal.ports] observe: error_rate=0.0 p95=2552ms unhealthy=['cart']
+[heal] observe: attempt 0: error_rate=0.0 p95=2552ms
+[heal.agents] diagnosis_agent: LLM not used (TimeoutError: LLM call exceeded the 2.6575s cap); rule-based fallback
+[heal] diagnosis_agent: [fallback] kill on cart: cart container exited; cart unhealthy (confidence 0.8, correct=True)
+[heal] remediation_agent: [llm] start_service(cart) -> restart_web(web)
+[heal.ports] heal_fix: start_service(cart) ok=True: started (was exited)
+[heal.ports] heal_fix: restart_web(web) ok=True: restarted
+[heal] apply_fix: attempt 1: start_service ok=True, restart_web ok=True
+[heal.ports] verify: steady after 46s (11 samples)
+[heal] verify: attempt 1: healed, recovery 46s
+[patcher] 1 live patches (restart_policy cart), 0 code suggestions (llm)
+[heal] harden_agent: round 1: restart_policy cart
+[heal.ports] apply: restart_policy cart
+[heal] apply_hardening: round 1: applied p1
+[heal.ports] observe: error_rate=0.219 p95=1019ms unhealthy=['cart']
+[heal.ports] heal_fix: start_service(cart) ok=True: already running
+[heal.ports] heal_fix: restart_web(web) ok=True: restarted
+[heal.ports] verify: steady after 25s (11 samples)
+[heal.ports] revert_all: 2 injected fault(s) reverted
+[heal] rerun: round 1: error_rate=0.219 recovery=25s data_survived=True
+[heal] compare: round 1: improved=True
+[heal] guard_revert: reverted fault e1 kill on cart
+[heal] report: outcome=healed hardening=improved_round1 attempts=1 rounds=1
+== Path ==
+understand -> chaos_agent -> guard_approve -> inject -> observe -> diagnosis_agent -> remediation_agent -> apply_fix -> verify -> harden_agent -> apply_hardening -> rerun -> compare -> guard_revert -> report
+== Report: outcome=healed hardening=improved_round1 attempts=1 rounds=1 experiment=e1 target=cart score={'before': 98, 'after': 85} ==
+== Prompt: 'kill the cache that cart uses'
+== Experiment: kill cart {"duration_s": 10}
