@@ -6,12 +6,70 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import requests
+
 from monitor import baseline, injector
 
 REC_MAX = 120  # give up measuring recovery after this many seconds
 REC_OK = 3  # consecutive in-band samples needed to call it recovered
 OUT = Path(__file__).resolve().parent.parent / "data" / "results" / "result.json"
 RDY_MULT, RDY_FLOOR = 3, 0.01  # steady-state fallback for a guard without ready(); same limits as P5's
+
+
+# Cart survival probe, through web's nginx: /api/cart/ -> cart:8080/  (web/default.conf.template)
+# cart/server.js routes: GET /add/:id/:sku/:qty (line 139), GET /cart/:id (line 84), DELETE /cart/:id (line 101)
+PROBE_TRIES = 3  # read-back attempts (1 s apart) before giving up on a transient error
+
+
+def _probe_create(cid):
+    """Add one item to a fresh test cart and confirm it reads back. Return (sku, None) or (None, why not)."""
+    ses = requests.Session()
+    sku = baseline._pick_sku(ses)
+    try:
+        add = ses.get(f"{baseline.URL}/api/cart/add/{cid}/{sku}/1", timeout=baseline.TMO)
+        if add.status_code != 200:
+            return None, f"add returned HTTP {add.status_code}"
+        if _probe_has(ses.get(f"{baseline.URL}/api/cart/cart/{cid}", timeout=baseline.TMO), sku) is not True:
+            return None, "cart did not read back right after creating it"
+    except requests.RequestException as exc:
+        return None, f"{type(exc).__name__}"
+    return sku, None
+
+
+def _probe_has(rsp, sku):
+    """True if the cart response holds sku, False if the cart is gone or lost the item, None if unreadable."""
+    if rsp.status_code == 404:
+        return False
+    if rsp.status_code != 200:
+        return None
+    try:
+        return any(itm.get("sku") == sku for itm in rsp.json().get("items", []))
+    except (ValueError, AttributeError):
+        return sku in rsp.text
+
+
+def _probe_read(cid, sku):
+    """Read the test cart back. Return (True|False|None, detail)."""
+    ses, det = requests.Session(), ""
+    for num in range(PROBE_TRIES):
+        try:
+            rsp = ses.get(f"{baseline.URL}/api/cart/cart/{cid}", timeout=baseline.TMO)
+            has = _probe_has(rsp, sku)
+            if has is not None:
+                return has, f"HTTP {rsp.status_code}"
+            det = f"HTTP {rsp.status_code}"
+        except requests.RequestException as exc:
+            det = type(exc).__name__
+        if num < PROBE_TRIES - 1:
+            time.sleep(1)
+    return None, det
+
+
+def _probe_delete(cid):
+    try:
+        requests.delete(f"{baseline.URL}/api/cart/cart/{cid}", timeout=baseline.TMO)
+    except requests.RequestException:
+        pass
 
 
 def _now():
@@ -121,9 +179,12 @@ def run(exp, bas, grd):
         grd.reset()
     pre = baseline.sample(1.0)
     nrd = _ready(grd, pre, bas)
+    cid = f"chaos-probe-{exp['id']}-{int(time.time())}"
+    sku, pnr, srv, sdt = None, None, None, ""
     if nrd:
         err = f"skipped, not injected: {nrd}"
     else:
+        sku, pnr = _probe_create(cid)
         try:
             rev = injector.inject(exp)
             _register(grd, rev, exp)
@@ -159,11 +220,26 @@ def run(exp, bas, grd):
         while time.monotonic() < t_rev + baseline.TMO + 0.5 and not grd.kill_switch():
             time.sleep(0.2)
         raw = baseline.sent_between(t0, t_rev)
+        if sku:
+            srv, sdt = _probe_read(cid, sku)
+    if sku or pnr:
+        _probe_delete(cid)
     agg = baseline.stats(raw)  # every request sent while the fault was active, with its final outcome
     res = {"id": exp["id"], "target": tgt, "fault": exp["fault"], "started_at": sta, "ended_at": _now(),
            "error_rate": agg["error_rate"] if raw else None, "p95_ms": agg["p95_ms"] if raw else None,
            "recovery_s": rec, "aborted": bool(abr or err), "abort_reason": abr or err,
+           "data_survived": srv,
            "observations": _observe(smps, agg, bas, tgt, abr, rec, rnm, err)}
+    if rev is not None and (sku or pnr):
+        if pnr:
+            res["observations"].append(f"cart probe not run: {pnr}")
+        elif srv is None:
+            res["observations"].append(f"cart probe: test cart {cid} could not be read back after recovery ({sdt})")
+        else:
+            res["observations"].append(f"cart probe: test cart {cid} with 1x {sku} created before the fault; after "
+                                       f"recovery it was {'still there' if srv else 'gone'} ({sdt}), data_survived={str(srv).lower()}")
+    if rev is not None and getattr(rev, "info", ""):
+        res["observations"].insert(0, f"fault applied: {rev.info}")
     _save(res)
     return res
 
