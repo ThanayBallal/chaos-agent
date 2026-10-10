@@ -1,7 +1,9 @@
 """P4: single LLM entry point, provider-agnostic. Config comes from .env (see agent/.env.example).
 
-LLM_PROVIDER = anthropic | gemini | openai (default anthropic), LLM_API_KEY = key for that provider,
+LLM_PROVIDER = anthropic | gemini | openai | ollama (default anthropic), LLM_API_KEY = key for that provider,
 LLM_MODEL optionally overrides the default model, CHAOS_NO_LLM=1 forces callers onto their fallbacks.
+ollama = Ollama Cloud via its OpenAI-compatible API at LLM_BASE_URL (default https://ollama.com/v1),
+falling back to Ollama's native /api/chat if that endpoint fails.
 Each ask_json call is capped at CAP seconds overall so a slow API cannot hang the demo.
 Each SDK is imported only when its provider is selected.
 """
@@ -13,8 +15,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENVS = [ROOT / ".env", ROOT / "agent" / ".env"]
-MDL = {"anthropic": "claude-opus-5-5", "gemini": "gemini-2.5-pro", "openai": "gpt-4.1"}
-PKG = {"anthropic": "anthropic", "gemini": "google-genai", "openai": "openai"}
+MDL = {"anthropic": "claude-opus-5-5", "gemini": "gemini-2.5-pro", "openai": "gpt-4.1", "ollama": "gpt-oss:120b"}
+PKG = {"anthropic": "anthropic", "gemini": "google-genai", "openai": "openai", "ollama": "openai"}
+IMP = {"gemini": "google.genai", "ollama": "openai"}  # module to import-check when it differs from the provider name
+BASE = "https://ollama.com/v1"
 CAP = 25.0
 
 
@@ -73,6 +77,52 @@ def _gemini(key, mdl, sys_prompt, usr_prompt, schema, tmo):
     return rsp.text
 
 
+def _ollama_compat(url, key, mdl, sys_prompt, usr_prompt, tmo):
+    from openai import OpenAI
+    cli = OpenAI(api_key=key, base_url=url, timeout=tmo, max_retries=1)
+    rsp = cli.chat.completions.create(
+        model=mdl,
+        messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": usr_prompt}],
+        response_format={"type": "json_object"},
+    )
+    cho = rsp.choices[0]
+    if cho.finish_reason != "stop":
+        raise RuntimeError(f"ollama stopped with {cho.finish_reason}")
+    return cho.message.content or ""
+
+
+def _ollama_native(url, key, mdl, sys_prompt, usr_prompt, tmo):
+    import requests
+    hst = url.rstrip("/").removesuffix("/v1")
+    rsp = requests.post(f"{hst}/api/chat", headers={"Authorization": f"Bearer {key}"}, timeout=tmo, json={
+        "model": mdl, "stream": False, "format": "json",
+        "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": usr_prompt}]})
+    rsp.raise_for_status()
+    obj = rsp.json()
+    if obj.get("done_reason") == "length":
+        raise RuntimeError("ollama native stopped with length")
+    txt = (obj.get("message") or {}).get("content")
+    if not txt:
+        raise RuntimeError("ollama native returned no content")
+    return txt
+
+
+def _ollama(key, mdl, sys_prompt, usr_prompt, schema, tmo):
+    """OpenAI-compatible endpoint first; on any failure retry once on Ollama's native /api/chat."""
+    url = os.environ.get("LLM_BASE_URL", "").strip() or BASE
+    end = time.monotonic() + tmo
+    try:
+        return _ollama_compat(url, key, mdl, sys_prompt, usr_prompt, tmo)
+    except Exception as err:
+        rem = end - time.monotonic()
+        if rem < 1:
+            raise
+        try:
+            return _ollama_native(url, key, mdl, sys_prompt, usr_prompt, rem)
+        except Exception as nat:
+            raise RuntimeError(f"ollama failed: openai-compatible: {err}; native /api/chat: {nat}") from nat
+
+
 def _bounded(fnc, tmo, *arg):
     """Run fnc(*arg, tmo) in a daemon thread; raise TimeoutError if it is still running after tmo seconds."""
     box = {}
@@ -93,7 +143,7 @@ def _bounded(fnc, tmo, *arg):
     return box["ok"]
 
 
-CALL = {"anthropic": _anthropic, "gemini": _gemini, "openai": _openai}
+CALL = {"anthropic": _anthropic, "gemini": _gemini, "openai": _openai, "ollama": _ollama}
 
 
 def config():
@@ -128,7 +178,7 @@ def ask_json(sys_prompt, usr_prompt, tries=3, schema=None, check=None, cap=None)
     """
     pvd, key, mdl = config()
     try:
-        __import__({"gemini": "google.genai"}.get(pvd, pvd))
+        __import__(IMP.get(pvd, pvd))
     except ImportError as err:
         raise RuntimeError(f"LLM_PROVIDER={pvd} needs `pip install {PKG[pvd]}` ({err})") from err
     if schema and pvd != "anthropic":
