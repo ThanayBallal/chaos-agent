@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from mapper.source_scan import scan_source_edges
+
 
 ROT = Path(__file__).resolve().parent.parent
 CMP = ROT.parent / "robot-shop" / "docker-compose.yaml"
@@ -280,6 +282,13 @@ def build_depmap(pth=CMP):
                     target,
                     _environment_evidence(env_name, env_value, target),
                 )
+
+    for source_edge in scan_source_edges(compose_path.parent, service_names):
+        add_edge(
+            source_edge["src"],
+            source_edge["dst"],
+            source_edge["evidence"],
+        )
 
     edges = []
     service_output = []
