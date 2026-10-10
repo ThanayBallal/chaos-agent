@@ -42,7 +42,7 @@ def read_data(filename: str) -> tuple[Any | None, str | None]:
             return json.load(artifact), None
     except FileNotFoundError:
         return None, None
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         return None, str(error)
 
 
@@ -152,7 +152,8 @@ depmap, depmap_error = read_data("depmap.json")
 st.divider()
 st.header("Run summary")
 if report_error:
-    st.error(f"Could not read data/heal_report.json: {report_error}")
+    section_missing()
+    st.caption(f"Could not read data/heal_report.json: {report_error}")
 elif not isinstance(report, dict):
     section_missing()
 else:
@@ -221,7 +222,8 @@ else:
 st.divider()
 st.header("Before vs after")
 if report_error:
-    st.error(f"Could not read data/heal_report.json: {report_error}")
+    section_missing()
+    st.caption(f"Could not read data/heal_report.json: {report_error}")
 else:
     hardening = pick(report, "hardening", "hardening_result", default=None) if isinstance(report, dict) else None
     before = pick(hardening, "before", "baseline", default={})
@@ -261,7 +263,8 @@ else:
 st.divider()
 st.header("AI code review")
 if review_error:
-    st.error(f"Could not read data/code_review.json: {review_error}")
+    section_missing()
+    st.caption(f"Could not read data/code_review.json: {review_error}")
 elif isinstance(code_review, dict) and isinstance(code_review.get("risks"), list) and code_review["risks"]:
     rows = []
     for risk in code_review["risks"]:
@@ -284,7 +287,8 @@ else:
 st.divider()
 st.header("Dependency map")
 if depmap_error:
-    st.error(f"Could not read data/depmap.json: {depmap_error}")
+    section_missing()
+    st.caption(f"Could not read data/depmap.json: {depmap_error}")
 elif isinstance(depmap, dict):
     services = depmap.get("services")
     edges = depmap.get("edges")
@@ -332,4 +336,4 @@ if isinstance(path_value, list) and path_value:
     )
     st.markdown(chips, unsafe_allow_html=True)
 else:
-    section_missing()\n
+    section_missing()
