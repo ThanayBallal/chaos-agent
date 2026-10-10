@@ -105,12 +105,12 @@ def test_redis_aof_apply_register_and_undo(monkeypatch, sandbox):
 
     patch.apply(patch_doc())
 
-    assert redis.exec_calls == [["redis-cli", "CONFIG", "SET", "appendonly", "yes"]]
+    assert redis.exec_calls == [["redis-cli", "CONFIG", "SET", "appendonly", "yes"], ["redis-cli", "CONFIG", "SET", "save", "1 1"]]
     assert len(registered) == 1
     assert registered[0][1]["undo_action"] == "redis_aof_disable"
     assert json.loads(state_file.read_text())["applied_fixes"][0]["status"] == "applied"
     registered[0][0]()
-    assert redis.exec_calls[-1] == ["redis-cli", "CONFIG", "SET", "appendonly", "no"]
+    assert redis.exec_calls[2:] == [["redis-cli", "CONFIG", "SET", "appendonly", "no"], ["redis-cli", "CONFIG", "SET", "save", "3600 1 300 100 60 10000"]]
     assert json.loads(state_file.read_text())["applied_fixes"] == []
     assert unregistered == [registered[0][0]]
 
@@ -167,13 +167,13 @@ def test_revert_reverse_order_and_state_cleanup(monkeypatch, sandbox):
     redis.exec_run = lambda cmd: (events.append(("redis", cmd)), original_exec(cmd))[1]
     cart.update = lambda **kw: (events.append(("cart", kw)), original_update(**kw))[1]
     patch.revert()
-    assert [name for name, _ in events] == ["cart", "redis"]
+    assert [name for name, _ in events] == ["cart", "redis", "redis"]  # redis_aof undo = appendonly + save
     assert json.loads(state_file.read_text())["applied_fixes"] == []
 
 
 def test_failed_undo_preserves_state(monkeypatch, sandbox):
     state_file, registered, _ = sandbox
-    redis = FakeContainer("redis", exec_results=[(0, b"OK"), (1, b"ERR failed")])
+    redis = FakeContainer("redis", exec_results=[(0, b"OK"), (0, b"OK"), (1, b"ERR failed")])
     monkeypatch.setattr(patch, "_docker_client", lambda: FakeClient(redis))
     patch.apply(patch_doc())
     with pytest.raises(patch.PatchError, match="could not be reverted"):
@@ -250,3 +250,29 @@ def test_restart_update_error_does_not_register(monkeypatch, sandbox):
         patch.apply(patch_doc("restart_policy", "cart"))
     assert json.loads(state_file.read_text())["applied_fixes"] == []
     assert registered == []
+
+
+def test_redis_aof_partial_apply_is_rolled_back(monkeypatch, sandbox):
+    state_file, registered, _ = sandbox
+    redis = FakeContainer("redis", exec_results=[(0, b"OK"), (1, b"ERR save failed")])
+    monkeypatch.setattr(patch, "_docker_client", lambda: FakeClient(redis))
+    with pytest.raises(patch.PatchError, match="save failed"):
+        patch.apply(patch_doc())
+    assert redis.exec_calls == [["redis-cli", "CONFIG", "SET", "appendonly", "yes"],
+                                ["redis-cli", "CONFIG", "SET", "save", "1 1"],
+                                ["redis-cli", "CONFIG", "SET", "appendonly", "no"]]
+    assert json.loads(state_file.read_text())["applied_fixes"] == []
+    assert registered == []
+
+
+def test_redis_aof_retried_undo_runs_both_settings(monkeypatch, sandbox):
+    state_file, registered, _ = sandbox
+    redis = FakeContainer("redis", exec_results=[(0, b"OK"), (0, b"OK"), (0, b"OK"), (1, b"ERR save failed")])
+    monkeypatch.setattr(patch, "_docker_client", lambda: FakeClient(redis))
+    patch.apply(patch_doc())
+    with pytest.raises(patch.PatchError, match="could not be reverted"):
+        patch.revert()
+    assert len(json.loads(state_file.read_text())["applied_fixes"]) == 1
+    patch.revert()
+    assert redis.exec_calls[-2:] == [["redis-cli", "CONFIG", "SET", "appendonly", "no"], ["redis-cli", "CONFIG", "SET", "save", "3600 1 300 100 60 10000"]]
+    assert json.loads(state_file.read_text())["applied_fixes"] == []
