@@ -41,10 +41,12 @@ SWEEP = ("unpause_service", "remove_latency", "stop_cpu_stress", "start_service"
 GUESS = (*FAULTS, "unknown")
 WORDS = {"kill": ("kill", "stop", "crash", "terminat"), "pause": ("pause", "freez", "frozen", "suspend"),
          "latency": ("latency", "delay", "slow", "lag"), "cpu_stress": ("cpu", "stress", "hog")}
+ROLES = {"cache": r"\bcach", "db": r"\b(?:database|datastore|dbs?\b)", "queue": r"\b(?:queue|broker)",
+         "proxy": r"\b(?:proxy|gateway)"}  # role words in a prompt -> depmap kind
 DOWN = ("exited", "dead", "created", "removing", "restarting")  # container states that mean it is not running
 LOG_N, LOG_W = ports.LOG_N, ports.LOG_W  # log lines per unhealthy service, characters per line
 TOP_RISKS = 5
-MIN_CAP = 3  # seconds: below this, a heal agent skips the LLM
+MIN_CAP = 8  # seconds: below this, a heal agent skips the LLM (a shorter call times out anyway and wastes quota)
 DFL_EXP = {"id": "e1", "target": "redis", "fault": "kill", "params": {"duration_s": 30}, "risk": "high", "rank": 1,
            "reason": "prompt named no target or fault and the code review found no risk: default experiment",
            "hypothesis": "cart requests fail while redis is down; recovers after restart"}
@@ -80,11 +82,31 @@ def _ask(nam, sys_prompt, task, dat, schema, check, cap=None):
 
 # ---- 1. chaos agent ----
 
+def _uses(dep, svc):
+    """Services svc depends on (depends_on and edges)."""
+    out = {dst for itm in dep.get("services", []) if itm["name"] == svc for dst in itm.get("depends_on") or []}
+    return out | {edg["dst"] for edg in dep.get("edges", []) if edg.get("src") == svc}
+
+
 def explicit(prompt, dep):
-    """What the prompt names: {"named": [depmap services], "fault": fault or None (None if zero or several match)}."""
+    """What the prompt asks for: {"named": [the target must be one of these], "fault": fault or None (None if zero or
+    several match)}. A role word (cache, database, queue, proxy) resolves to services of that kind: "the redis cache"
+    -> redis, "the cache that cart uses" / "the database behind the catalogue" -> the dependency of that kind,
+    "pause the database" -> every database."""
     low = (prompt or "").lower()
     nam = [svc for svc in names(dep) if re.search(rf"\b{re.escape(svc.lower())}\b", low)]
     fal = [fal for fal, wds in WORDS.items() if re.search(rf"\b(?:{'|'.join(wds)})", low)]
+    rol = {knd for knd, pat in ROLES.items() if re.search(pat, low)}
+    if rol:
+        ofk = {svc["name"] for svc in dep.get("services", []) if svc.get("kind") in rol}
+        own = [svc for svc in nam if svc in ofk]
+        use = sorted(set().union(set(), *(_uses(dep, svc) for svc in nam)) & ofk)
+        if own:
+            nam = own
+        elif nam and use:
+            nam = use
+        elif not nam:
+            nam = sorted(ofk)
     return {"named": nam, "fault": fal[0] if len(fal) == 1 else None}
 
 
@@ -132,7 +154,7 @@ def fallback_experiment(prompt, risks, dep):
 CHAOS_SYS = f"""You are the chaos agent of a self-healing loop on the Docker Compose app "robot-shop".
 Choose exactly ONE fault-injection experiment.
 Rules:
-- The user's prompt decides. If it names a service and/or a fault ("kill redis", "slow down mysql"), use exactly that service and fault. The field "prompt_names" lists what was detected in the prompt; your answer must match it.
+- The user's prompt decides. If it names a service and/or a fault ("kill redis", "slow down mysql", "kill the cache that cart uses"), use exactly that service and fault. The field "prompt_names" lists what was detected in the prompt (a role such as "the cache that cart uses" is already resolved to that dependency); your target must be one of "services" there, and your fault must match it.
 - Only if the prompt names neither may you choose yourself: pick the top code-review risk (highest weight first) and say in the reason that the prompt was vague and you chose the top code-review risk (cite its file:line).
 - target must be a service from "services". fault and params must come from "faults" (exact keys, positive integers), duration_s <= {MAX_DUR}, latency delay_ms < {P95_MAX}. Honour numbers the prompt gives (duration, delay) within these limits.
 - reason: why this experiment, citing the prompt, the code-review risk or the dependency map. hypothesis: a falsifiable prediction of what will be observed while the fault is active and after it is healed. Never invent measurements."""
@@ -155,7 +177,7 @@ def check_experiment(raw, prompt, risks, dep):
     if fal not in FAULTS:
         raise ValueError(f"fault '{fal}' must be one of {list(FAULTS)}")
     if exq["named"] and tgt not in exq["named"]:
-        raise ValueError(f"the user's prompt names {exq['named']}; target must be {' or '.join(exq['named'])}")
+        raise ValueError(f"the user's prompt asks for {exq['named']}; target must be {' or '.join(exq['named'])}")
     if exq["fault"] and fal != exq["fault"]:
         raise ValueError(f"the user's prompt asks for fault '{exq['fault']}', not '{fal}'")
     src = raw.get("params") if isinstance(raw.get("params"), dict) else {}

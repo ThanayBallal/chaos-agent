@@ -78,9 +78,23 @@ def test_explicit_prompt_is_honored(fake):
 
 @pytest.mark.parametrize("prm,tgt,fal", [("kill redis", ["redis"], "kill"), ("please pause mysql for 20s", ["mysql"], "pause"),
                                          ("slow down the catalogue", ["catalogue"], "latency"),
-                                         ("stress cart cpu", ["cart"], "cpu_stress"), ("break something", [], None)])
+                                         ("stress cart cpu", ["cart"], "cpu_stress"), ("break something", [], None),
+                                         ("kill the cache that cart uses", ["redis"], "kill"),
+                                         ("slow down the database behind the catalogue", ["mongodb"], "latency"),
+                                         ("kill the redis cache", ["redis"], "kill"),
+                                         ("pause the database", ["mongodb", "mysql"], "pause"),
+                                         ("kill the queue payment uses", ["rabbitmq"], "kill"),
+                                         ("freeze the ratings service", ["ratings"], "pause")])
 def test_explicit_parses_prompt(prm, tgt, fal):
     assert agents.explicit(prm, DEP) == {"named": tgt, "fault": fal}
+
+
+def test_role_in_prompt_resolves_to_the_dependency(fake):
+    fkl = fake({**CHAOS_OK, "target": "cart"}, CHAOS_OK)  # the LLM is held to redis, not the service it read
+    exp, met = agents.plan_experiment("kill the cache that cart uses", [], DEP)
+    assert (exp["target"], exp["fault"], met["source"]) == ("redis", "kill", "llm") and "redis" in fkl.errors[0]
+    exp = agents.fallback_experiment("slow down the database behind the catalogue", [], DEP)
+    assert (exp["target"], exp["fault"]) == ("mongodb", "latency")
 
 
 def test_vague_prompt_may_pick_top_risk_and_says_so(fake):
@@ -178,8 +192,10 @@ def test_brief_caps_logs():
 
 def test_heal_deadline_near_skips_the_llm(fake):
     fkl = fake(DIAG_OK)
-    _, met = agents.diagnose(agents.brief(blind_state()["symptoms"], BAS), DEP, cap=1)
+    _, met = agents.diagnose(agents.brief(blind_state()["symptoms"], BAS), DEP, cap=agents.MIN_CAP - 0.5)
     assert met["source"] == "fallback" and "deadline" in met["why"] and not fkl.calls
+    _, met = agents.diagnose(agents.brief(blind_state()["symptoms"], BAS), DEP, cap=agents.MIN_CAP)
+    assert met["source"] == "llm" and fkl.calls[0]["cap"] == agents.MIN_CAP
 
 
 # ---- remediation agent ----
@@ -255,3 +271,16 @@ def test_cli_prints_the_story(fake, capsys):
                 "== Action attempt 1: start_service(redis)", "== Healed", "== Hardening round 1",
                 "== Agents: chaos_agent=llm, diagnosis_agent=llm, remediation_agent=llm"):
         assert txt in out
+
+
+def test_cli_survives_a_console_that_cannot_encode_llm_text(fake, monkeypatch):
+    import io
+    import sys
+    buf = io.BytesIO()
+    out = io.TextIOWrapper(buf, encoding="cp1252")  # a Windows redirect without PYTHONIOENCODING
+    monkeypatch.setattr(sys, "stdout", out)
+    fake({**CHAOS_OK, "hypothesis": "cart fails \u2192 recovers \u2265 baseline"}, DIAG_OK, REM_OK)
+    assert cli.main(["kill redis", "--stub", "--scenario", "healed"]) == 0
+    out.flush()
+    txt = buf.getvalue().decode("cp1252")
+    assert "hypothesis: cart fails ? recovers ? baseline" in txt and "== Agents: chaos_agent=llm" in txt

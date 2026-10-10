@@ -44,7 +44,18 @@ def show(rpt):
         for nam, mets in agt.items()))
 
 
+def safe_output():
+    """LLM text can hold characters the console cannot encode (e.g. an arrow on a cp1252 redirect): print them as '?'
+    instead of raising mid-run. ASCII output is unchanged."""
+    for stm in (sys.stdout, sys.stderr):
+        try:
+            stm.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv=None):
+    safe_output()
     arg = argparse.ArgumentParser(prog="python -m heal.run")
     arg.add_argument("prompt")
     mod = arg.add_mutually_exclusive_group()
