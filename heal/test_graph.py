@@ -2,6 +2,7 @@
 import functools
 import importlib
 import inspect
+import json
 
 import pytest
 
@@ -414,3 +415,134 @@ def test_real_hardening_signatures_bind_port_arguments():
     inspect.signature(patch.apply).bind({})
     inspect.signature(patch.revert).bind()
     inspect.signature(cmp_mod.compare).bind([], [], {}, {}, pat=None)
+
+
+# hardening honesty
+def pair(err=(0.3, 0.3), rec=(20, 20), srv=(True, True), scr=(80, 80)):
+    return {"score": {"before": scr[0], "after": scr[1]},
+            "experiments": [{"id": "e1", "error_rate": list(err), "recovery_s": list(rec), "data_survived": list(srv)}]}
+
+
+PAT = [{"id": "p1", "fix": "restart_policy", "service": "cart"}]
+
+
+@pytest.mark.parametrize("cmp,pts,imp,why", [
+    (pair(srv=(False, True)), [], False, "no patch applied"),
+    (pair(srv=(False, True)), PAT, True, "data_survived false -> true"),
+    (pair(err=(0.0, 0.219), scr=(98, 85)), PAT, False, "score 98 -> 85"),  # live redis run: regressed
+    (pair(err=(0.0, 0.219), srv=(False, True)), PAT, False, "error_rate 0.0 -> 0.219"),  # gain but regressed
+    (pair(err=(0.10, 0.15), srv=(False, True)), PAT, True, "data_survived"),  # +0.05 is within noise
+    (pair(err=(0.30, 0.20)), PAT, True, "error_rate 0.3 -> 0.2"),
+    (pair(rec=(30, 18)), PAT, True, "recovery 30s -> 18s"),  # -40% and -12 s
+    (pair(rec=(20, 12)), PAT, False, "no gain beyond noise"),  # -40% but only 8 s
+    (pair(rec=(100, 85)), PAT, False, "no gain beyond noise"),  # -15 s but only 15%
+    (pair(), PAT, False, "no gain beyond noise")])
+def test_verdict_is_honest(cmp, pts, imp, why):
+    out = graph.verdict(cmp, pts)
+    assert out["improved"] is imp and why in out["why"]
+
+
+def test_no_patch_skips_rerun_and_is_not_applicable(monkeypatch, calls, capsys):
+    monkeypatch.setattr(ports, "make", lambda *arg, **kw: {"patches": [], "code_suggestions": []})
+    sta, pth = graph.run("p", "healed")
+    assert pth[-3:] == ["harden_agent", "guard_revert", "report"] and "rerun" not in pth
+    assert not calls["apply"] and not calls["compare"]
+    rpt = sta["report"]
+    assert rpt["hardening"] == "not_applicable" and rpt["hardening_note"] == graph.NO_FIX
+    assert rpt["outcome"] == "healed" and rpt["hardening_rounds"] == [] and rpt["data_survived"]["rerun"] == []
+
+
+def test_round2_without_a_patch_is_not_improved(monkeypatch):
+    org = ports.make
+    monkeypatch.setattr(ports, "make", lambda fnd, pln, dep, rsl=None, exclude=None:
+                        org(fnd, pln, dep, rsl=rsl) if exclude is None else {"patches": [], "code_suggestions": []})
+    sta, pth = graph.run("p", "healed", harden="never")
+    assert pth[-4:] == ["revert_patch", "harden_agent", "guard_revert", "report"]
+    assert sta["report"]["hardening"] == "not_improved" and graph.NO_FIX in sta["report"]["hardening_note"]
+
+
+def test_compare_carries_the_verdict():
+    sta, _ = graph.run("p", "healed", harden="never")
+    assert all(itm["verdict"] == {"improved": False, "why": "no gain beyond noise"} for itm in sta["comparisons"])
+    assert [itm["improved"] for itm in sta["report"]["hardening_rounds"]] == [False, False]
+
+
+def test_report_shows_data_survived_before_and_rerun(capsys):
+    assert cli.main(["kill redis", "--stub", "--scenario", "healed"]) == 0
+    out = capsys.readouterr().out
+    assert "== Data survived (cart probe): before=False (cart lost), rerun 1=True (cart kept)" in out
+    assert "before -> after: error_rate=[0.62, 0.05]" in out and "improved=True (data_survived false -> true" in out
+
+
+def test_cli_prints_not_applicable(monkeypatch, capsys):
+    monkeypatch.setattr(ports, "make", lambda *arg, **kw: {"patches": [], "code_suggestions": []})
+    assert cli.main(["kill redis", "--stub", "--scenario", "healed"]) == 0
+    assert f"== Hardening: not applicable ({graph.NO_FIX})" in capsys.readouterr().out
+
+
+# heal_report.json (live only)
+def test_stub_run_never_writes_the_report(monkeypatch, tmp_path):
+    monkeypatch.setattr(graph, "REPORT", tmp_path / "heal_report.json")
+    graph.run("p", "healed")
+    assert not (tmp_path / "heal_report.json").exists()
+
+
+def test_save_report_has_everything(tmp_path):
+    sta, pth = graph.run("kill redis", "healed")
+    out = graph.save_report(sta["report"], pth, tmp_path / "heal_report.json")
+    rpt = json.loads(out.read_text(encoding="utf-8"))
+    assert rpt["path"] == pth and rpt["prompt"] == "kill redis"
+    assert set(rpt["experiment_detail"]) >= {"target", "fault", "params", "reason", "hypothesis"}
+    assert set(rpt["symptoms"]) >= {"error_rate", "unhealthy", "containers_not_running"}
+    assert set(rpt["diagnosis"]) >= {"suspect_service", "fault_guess", "evidence", "confidence"}
+    assert rpt["diagnosis_correct"] is True and rpt["healed"] is True and "healed_in_s" in rpt
+    assert rpt["applied_fixes"][0]["ok"] is True and rpt["agents"]["chaos_agent"] == ["fallback"]
+    (rnd,) = rpt["hardening_rounds"]
+    assert {"patches", "error_rate", "recovery_s", "data_survived", "score", "improved", "why"} <= set(rnd)
+
+
+# kill switch during hardening
+def test_stop_before_round1_applies_nothing(monkeypatch, calls, capsys):
+    from safety import guard
+    monkeypatch.setattr(guard, "kill_switch", lambda: True)
+    sta, pth = graph.run("p", "healed")
+    assert pth[-3:] == ["harden_agent", "guard_revert", "report"] and not calls["apply"]
+    assert sta["report"]["outcome"] == "stopped_by_kill_switch" and sta["report"]["healed"] is True
+    assert calls["revert_all"] == [((), {})]
+
+
+def test_stop_after_round1_skips_round2(monkeypatch, calls):
+    from safety import guard
+    flg = {"stop": False}
+    org = ports.apply
+    monkeypatch.setattr(guard, "kill_switch", lambda: flg["stop"])
+    monkeypatch.setattr(ports, "apply", lambda pat: (org(pat), flg.update(stop=True)))  # STOP during the rerun
+    sta, pth = graph.run("p", "healed", harden="never")
+    assert pth[-3:] == ["compare", "guard_revert", "report"]
+    assert pth.count("harden_agent") == 1 and not calls["revert_patch"] and len(calls["apply"]) == 1
+    assert sta["report"]["outcome"] == "stopped_by_kill_switch" and sta["report"]["stopped"] == graph.KILL
+
+
+def test_cli_prints_stop(monkeypatch, capsys):
+    from safety import guard
+    monkeypatch.setattr(guard, "kill_switch", lambda: True)
+    assert cli.main(["kill redis", "--stub", "--scenario", "healed"]) == 0
+    out = capsys.readouterr().out
+    assert "outcome=stopped_by_kill_switch" in out and "== Healed" in out and "== Stopped by kill switch" in out
+
+
+def test_apply_hardening_checks_stop_itself(monkeypatch, calls):
+    from safety import guard
+    monkeypatch.setattr(guard, "kill_switch", lambda: True)
+    out = graph.apply_hardening({"round": 2, "hardening": {"round": 2, "patch": {"patches": PAT}}}, {})
+    assert out["stopped"] == graph.KILL and not calls["apply"] and graph.route_stop(out) == "stop"
+
+
+def test_stop_routes(monkeypatch):
+    from safety import guard
+    monkeypatch.setattr(guard, "kill_switch", lambda: False)
+    sta = {"round": 1, "comparisons": [cmp(False)], "hardening": {"patch": {"patches": PAT}}}
+    assert route_compare(sta) == "round2" and graph.route_harden(sta) == "apply"
+    assert route_compare({**sta, "stopped": graph.KILL}) == "done" and graph.route_harden({**sta, "stopped": "x"}) == "skip"
+    monkeypatch.setattr(guard, "kill_switch", lambda: True)
+    assert route_compare(sta) == "done" and graph.route_harden(sta) == "skip"
