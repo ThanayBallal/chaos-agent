@@ -2,7 +2,7 @@
 import json
 import re
 
-from agent import code_review, llm
+from agent import code_review, llm, patcher
 
 SEV = [(0.5, "critical"), (0.2, "high"), (0.05, "medium"), (0.0, "low")]
 ORD = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -10,6 +10,7 @@ PEN = {"critical": 25, "high": 15, "medium": 7, "low": 2}
 VRD = {"matched": True, "not_matched": False, "inconclusive": None}
 NUM = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
 MET = ("error_rate", "p95_ms", "recovery_s")
+LOSS = re.compile(r"data[- ]loss|lost data|data (was|is|were) lost|loses data", re.I)
 
 SYS = """You analyze chaos-engineering experiments run against the Docker Compose app "robot-shop".
 For each experiment you get the plan (target, fault, params, hypothesis), the MEASURED result (error_rate, p95_ms, recovery_s, aborted, abort_reason, observations), the pre-fault baseline and the dependency map.
@@ -17,7 +18,7 @@ For each experiment you get the plan (target, fault, params, hypothesis), the ME
 For every experiment return:
 - weakness: one or two sentences explaining what the measurements show broke and why, using the dependency map to name the affected services.
 - hypothesis: "matched" if the observations and metrics confirm the hypothesis, "not_matched" if they contradict it, "inconclusive" if the data cannot decide or there is no hypothesis.
-- severity: critical | high | medium | low, judged by user impact in the measured data.
+- severity: critical | high | medium | low, judged by user impact in the measured data. A result with data_survived false means stored data was lost: severity at least high, and the weakness must say "data loss".
 - fix: concrete, actionable changes naming the service and file to change (when code_weaknesses are given, fix those exact file:line locations), chosen from: compose restart policy (restart: always / unless-stopped), a compose healthcheck plus depends_on condition: service_healthy, client retries with exponential backoff, connection/request timeouts, replicas or a graceful fallback. Each fix must cite the measured evidence that motivates it (quote at least one measured error_rate, p95_ms or recovery_s value).
 
 Hard rule: every number you write must be copied verbatim from the provided data. Never invent metrics, thresholds, counts, durations or percentages. If a config value would need a number that is not in the data, describe it without a number."""
@@ -34,12 +35,26 @@ def evidence(res, bas):
     rec = f"recovery {res['recovery_s']}s" if res.get("recovery_s") is not None else "no recovery measured"
     out = (f"error_rate {bas['error_rate']} -> {res['error_rate']}, "
            f"p95 {bas['p95_ms']} -> {res['p95_ms']}ms, {rec}")
+    if res.get("data_survived") is False:
+        out += ", data_survived false"
     return f"{out}, aborted: {res['abort_reason']}" if res.get("aborted") else out
 
 
+def data_loss(itm, res):
+    """A result with data_survived == false is at least high severity and its weakness says so."""
+    if res.get("data_survived") is not False:
+        return itm
+    itm["severity"] = min(itm["severity"], "high", key=ORD.get)
+    if not LOSS.search(itm["weakness"]):
+        itm["weakness"] = f"Data loss: data stored before the {res['fault']} on {res['target']} did not survive. "                           + itm["weakness"]
+    return itm
+
+
 def finish(fnd, rsl):
-    """Sort by severity then error_rate, assign ranks, compute resilience_score."""
+    """Apply the data-loss floor, sort by severity then error_rate, assign ranks, compute resilience_score."""
     err = {res["id"]: res["error_rate"] for res in rsl}
+    rby = {res["id"]: res for res in rsl}
+    fnd = [data_loss(itm, rby[itm["experiment"]]) for itm in fnd]
     fnd.sort(key=lambda itm: (ORD[itm["severity"]], -err[itm["experiment"]]))
     for idx, itm in enumerate(fnd, 1):
         itm["rank"] = idx
@@ -147,7 +162,18 @@ def prompt(dep, bas, rsl, pex):
 
 
 def analyze(dep, bas, rsl, pln=None):
-    """Return a dict matching contracts.md findings.json. LLM first, else rule-based fallback."""
+    """Return a dict matching contracts.md findings.json (LLM first, else rule-based fallback).
+    Also writes data/patch.json from the findings via patcher.make (never fails the analysis)."""
+    fnd = _analyze(dep, bas, rsl, pln)
+    if fnd["findings"]:
+        try:
+            patcher.make(fnd, pln, dep)
+        except Exception as err:
+            print(f"[analyst] patch step failed ({str(err)[:160]})")
+    return fnd
+
+
+def _analyze(dep, bas, rsl, pln=None):
     if not rsl:
         return fallback(dep, bas, rsl, pln)
     pex = {exp["id"]: exp for exp in pln or []}

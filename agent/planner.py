@@ -2,6 +2,7 @@
 2) LLM plan from the dependency map, 3) deterministic centrality fallback. All validated by the safety guard."""
 import json
 import os
+from collections import Counter
 
 from agent import code_review, llm
 from safety import guard
@@ -11,6 +12,14 @@ DEF = {"db": "pause", "cache": "kill", "queue": "kill", "proxy": "latency", "app
 PRM = {"kill": {"duration_s": 30}, "pause": {"duration_s": 30},
        "latency": {"duration_s": 30, "delay_ms": 500}, "cpu_stress": {"duration_s": 30, "cpus": 1}}
 RSK = ["high", "medium", "low"]
+CORE = ("kill", "pause", "cpu_stress")  # with top >= 3 every plan covers these; latency only as 4th+
+FIT = {"kill": ["cache", "queue", "app"], "pause": ["db", "cache", "queue", "app"],
+       "cpu_stress": ["app", "proxy"], "latency": ["db", "cache", "app"]}
+HYP = {"kill": "requests that need {nam} fail while it is down and recover after it restarts",
+       "pause": "requests that need {nam} hang or time out while it is frozen and recover after unpause",
+       "cpu_stress": "{nam} slows under CPU pressure so p95 rises for its callers while errors stay near "
+                     "baseline; latency returns to baseline after the stress ends",
+       "latency": "callers of {nam} slow down by about the injected delay; errors rise only if they time out"}
 
 SYS = f"""You plan fault-injection experiments for a chaos-engineering agent testing the Docker Compose app "robot-shop".
 Pick the experiments that reveal the most about the app's resilience, most informative first.
@@ -138,8 +147,59 @@ def _fill(pln, dep, top):
     return pln
 
 
+def _extra(fal, pln, dep, bas):
+    """A new experiment with fault fal on the best-fitting healthy target not already in pln (kind, then centrality)."""
+    cen = centrality(dep)
+    knd = {svc["name"]: svc["kind"] for svc in dep["services"]}
+    hea = bas.get("health", {})
+    use = {exp["target"] for exp in pln}
+    pre = FIT[fal]
+    cnd = [nam for nam in cen if nam not in use and hea.get(nam, "healthy") == "healthy" and knd.get(nam) in pre]
+    for nam in sorted(cnd, key=lambda nam: (pre.index(knd[nam]), -cen[nam], nam)):
+        exp = {"id": "new", "target": nam, "fault": fal, "params": dict(PRM[fal]),
+               "risk": "high" if cen[nam] >= 3 else "medium", "rank": 0,
+               "reason": f"fault diversity: adds a {fal} experiment; {cen[nam]} services depend on {nam} (transitively)",
+               "hypothesis": HYP[fal].format(nam=nam)}
+        if not guard.approve(exp, dep, mock=True):
+            return exp
+    return None
+
+
+def diversify(pln, dep, bas, top=3):
+    """When top >= 3, make sure kill, pause and cpu_stress all appear; latency only after them (4th or later)."""
+    if top < 3:
+        return pln
+    own = [(exp, code_review.risks_for(exp["id"])) for exp in pln]  # keeps code risks attached through renumbering
+    pln = list(pln)
+    for fal in CORE:
+        if any(exp["fault"] == fal for exp in pln):
+            continue
+        vic = None
+        if len(pln) >= top:
+            cnt = Counter(exp["fault"] for exp in pln)
+            vic = next((exp for exp in reversed(pln) if exp["fault"] not in CORE or cnt[exp["fault"]] > 1), None)
+            if vic is None:
+                continue
+        new = _extra(fal, [exp for exp in pln if exp is not vic], dep, bas)
+        if new is None:
+            continue
+        if vic is not None:
+            pln.remove(vic)
+        pln.append(new)  # diversity picks rank after the code/LLM-chosen experiments
+        print(f"[planner] added {fal} on {new['target']} so the plan covers {len(CORE)} fault types")
+    pln.sort(key=lambda exp: exp["fault"] not in CORE)  # stable: latency goes after the core faults
+    code_review.LAST.clear()
+    for idx, exp in enumerate(pln, 1):
+        exp.update(id=f"e{idx}", rank=idx)
+        rsk = next((rsk for old, rsk in own if old is exp), [])
+        if rsk:
+            code_review.LAST[exp["id"]] = rsk
+    return pln
+
+
 def plan(dep, bas, top=3):
-    """Return a plan.json-shaped list: code-review plan first, else LLM graph plan, else deterministic fallback."""
+    """Return a plan.json-shaped list: code-review plan first, else LLM graph plan, else deterministic fallback.
+    With top >= 3 the plan always covers kill, pause and cpu_stress (see diversify)."""
     if not os.environ.get("CHAOS_NO_CODE"):
         try:
             pln = code_review.to_plan(code_review.review(dep), dep, bas, centrality(dep), top)
@@ -148,7 +208,7 @@ def plan(dep, bas, top=3):
                 for exp in pln:
                     for rsk in code_review.risks_for(exp["id"])[:2]:
                         print(f"   {exp['id']} {exp['fault']} {exp['target']} <- {rsk['file']}:{rsk['line']}  {rsk['quote'][:70]}")
-                return _fill(pln, dep, top)
+                return diversify(_fill(pln, dep, top), dep, bas, top)
         except Exception as err:
             print(f"[planner] code review skipped ({str(err)[:160]})")
     try:
@@ -158,5 +218,6 @@ def plan(dep, bas, top=3):
     except Exception as err:
         print(f"[planner] LLM plan unavailable ({str(err)[:160]}); using deterministic fallback")
         pln = fallback(dep, top)
+    pln = diversify(pln, dep, bas, top)
     assert all(exp["fault"] in FAULTS for exp in pln)
     return pln
