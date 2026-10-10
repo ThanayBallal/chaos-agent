@@ -12,7 +12,8 @@ DEF = {"db": "pause", "cache": "kill", "queue": "kill", "proxy": "latency", "app
 PRM = {"kill": {"duration_s": 30}, "pause": {"duration_s": 30},
        "latency": {"duration_s": 30, "delay_ms": 500}, "cpu_stress": {"duration_s": 30, "cpus": 1}}
 RSK = ["high", "medium", "low"]
-CORE = ("kill", "pause", "cpu_stress")  # with top >= 3 every plan covers these; latency only as 4th+
+CORE = ("kill", "pause", "cpu_stress")  # latency is only planned with CHAOS_ALLOW_LATENCY=1, and after these
+ADD = ("pause", "cpu_stress", "kill")  # order diversify fills missing types in: pause on a db, cpu_stress on an app
 FIT = {"kill": ["cache", "queue", "app"], "pause": ["db", "cache", "queue", "app"],
        "cpu_stress": ["app", "proxy"], "latency": ["db", "cache", "app"]}
 HYP = {"kill": "requests that need {nam} fail while it is down and recover after it restarts",
@@ -29,10 +30,15 @@ Rules:
 - Allowed faults and their exact params: {json.dumps({fal: sorted(prm) for fal, prm in FAULTS.items()})}. Give only the params listed for the chosen fault, all as integers.
 - duration_s must be 1..{MAX_DUR}. latency delay_ms must be below {P95_MAX} (the abort threshold). cpu_stress cpus >= 1.
 - Only target services that appear in the dependency map and are healthy in the baseline. Do not repeat the same target+fault.
-- Prefer high-centrality shared dependencies and faults that fit the service kind (e.g. pause or latency on databases, kill on caches and queues).
+- Prefer high-centrality shared dependencies and faults that fit the service kind (e.g. pause on databases, kill on caches and queues, cpu_stress on app services).
 - reason: why this experiment matters, citing the dependency map (name the dependents) and the centrality score.
 - hypothesis: a falsifiable prediction of what will be observed during the fault and after it is reverted. Do not put numbers you were not given in it.
 - risk: high | medium | low. rank: 1 = run first."""
+
+
+def faults():
+    """Faults the planner may choose: the allowlist, minus latency unless CHAOS_ALLOW_LATENCY=1."""
+    return sorted(fal for fal in FAULTS if fal != "latency" or code_review.latency_ok())
 
 
 def centrality(dep):
@@ -59,6 +65,8 @@ def fallback(dep, top=3):
     pln = []
     for idx, nam in enumerate(rnk, 1):
         fal = DEF[knd[nam]]
+        if fal == "latency" and not code_review.latency_ok():
+            fal = "cpu_stress"
         pln.append({"id": f"e{idx}", "target": nam, "fault": fal, "params": dict(PRM[fal]),
                     "risk": "high" if cen[nam] >= 3 else "medium", "rank": idx,
                     "reason": f"{cen[nam]} services depend on {nam} (transitively)",
@@ -74,7 +82,7 @@ def schema(dep):
            "required": ["target", "fault", "params", "risk", "rank", "reason", "hypothesis"],
            "properties": {
                "target": {"type": "string", "enum": sorted(svc["name"] for svc in dep["services"])},
-               "fault": {"type": "string", "enum": sorted(FAULTS)},
+               "fault": {"type": "string", "enum": faults()},
                "params": {"type": "object", "additionalProperties": False, "required": ["duration_s"],
                           "properties": {key: num for key in sorted(set().union(*FAULTS.values()))}},
                "risk": {"type": "string", "enum": RSK},
@@ -97,8 +105,8 @@ def validate(raw, dep, bas, top=3):
             raise ValueError(f"experiment {idx} is not an object")
         tgt, fal = exp.get("target"), exp.get("fault")
         tag = f"experiment {idx} ({tgt}/{fal})"
-        if fal not in FAULTS:
-            raise ValueError(f"{tag}: fault must be one of {sorted(FAULTS)}")
+        if fal not in faults():
+            raise ValueError(f"{tag}: fault must be one of {faults()}")
         src = exp.get("params") or {}
         prm = {key: src.get(key) for key in sorted(FAULTS[fal])}
         bad = [key for key, val in prm.items() if not isinstance(val, int) or isinstance(val, bool) or val < 1]
@@ -130,7 +138,7 @@ def prompt(dep, bas, top):
     dat = {"max_experiments": top, "centrality": dict(sorted(cen.items(), key=lambda kv: -kv[1])),
            "services": [{key: svc.get(key) for key in ("name", "kind", "depends_on")} for svc in dep["services"]],
            "edges": dep["edges"], "baseline": pub(bas)}
-    return f"Plan at most {top} experiments. Return {{\"experiments\": [...]}}.\n\n{json.dumps(dat, indent=1)}"
+    return f"Plan at most {top} experiments using only these faults: {faults()}. Return {{\"experiments\": [...]}}.\n\n{json.dumps(dat, indent=1)}"
 
 
 def _fill(pln, dep, top):
@@ -165,19 +173,42 @@ def _extra(fal, pln, dep, bas):
     return None
 
 
+def _state_kill(exp):
+    """A kill that tests a data/state-loss weakness (e.g. carts kept only in redis)."""
+    return exp["fault"] == "kill" and any(map(code_review.state_loss, code_review.risks_for(exp["id"])))
+
+
+def no_latency(pln):
+    """Swap latency for pause unless CHAOS_ALLOW_LATENCY=1 (safety net for every plan source)."""
+    if code_review.latency_ok():
+        return pln
+    for exp in pln:
+        if exp["fault"] == "latency":
+            exp.update(fault="pause", params=dict(PRM["pause"]),
+                       hypothesis=HYP["pause"].format(nam=exp["target"]),
+                       reason=f"{exp['reason']} (latency disabled: tested with pause)"[:600])
+    return pln
+
+
 def diversify(pln, dep, bas, top=3):
-    """When top >= 3, make sure kill, pause and cpu_stress all appear; latency only after them (4th or later)."""
-    if top < 3:
+    """Order: kills that test a data/state-loss weakness first, then the top-ranked experiment, then the rest.
+    When top >= 3, make the plan cover at least 3 different fault types by replacing lower-ranked duplicates
+    (or appending): pause on a db and cpu_stress on an app first. Protected experiments are never changed."""
+    if not pln:
         return pln
     own = [(exp, code_review.risks_for(exp["id"])) for exp in pln]  # keeps code risks attached through renumbering
+    sta = [exp for exp in pln if _state_kill(exp)]
+    top0 = pln[0]
+    fix = sta + [top0]
     pln = list(pln)
-    for fal in CORE:
-        if any(exp["fault"] == fal for exp in pln):
+    for fal in ADD if top >= 3 else ():
+        if len({exp["fault"] for exp in pln}) >= 3 or any(exp["fault"] == fal for exp in pln):
             continue
         vic = None
         if len(pln) >= top:
             cnt = Counter(exp["fault"] for exp in pln)
-            vic = next((exp for exp in reversed(pln) if exp["fault"] not in CORE or cnt[exp["fault"]] > 1), None)
+            vic = next((exp for exp in reversed(pln) if not any(exp is one for one in fix)
+                        and (exp["fault"] not in CORE or cnt[exp["fault"]] > 1)), None)
             if vic is None:
                 continue
         new = _extra(fal, [exp for exp in pln if exp is not vic], dep, bas)
@@ -186,8 +217,11 @@ def diversify(pln, dep, bas, top=3):
         if vic is not None:
             pln.remove(vic)
         pln.append(new)  # diversity picks rank after the code/LLM-chosen experiments
-        print(f"[planner] added {fal} on {new['target']} so the plan covers {len(CORE)} fault types")
-    pln.sort(key=lambda exp: exp["fault"] not in CORE)  # stable: latency goes after the core faults
+        print(f"[planner] added {fal} on {new['target']} so the plan covers 3 fault types")
+    rest = [exp for exp in pln if not any(exp is one for one in sta)]
+    head = [exp for exp in rest[:1] if exp is top0]
+    tail = sorted(rest[len(head):], key=lambda exp: exp["fault"] not in CORE)  # stable: latency last
+    pln = sta + head + tail
     code_review.LAST.clear()
     for idx, exp in enumerate(pln, 1):
         exp.update(id=f"e{idx}", rank=idx)
@@ -199,7 +233,8 @@ def diversify(pln, dep, bas, top=3):
 
 def plan(dep, bas, top=3):
     """Return a plan.json-shaped list: code-review plan first, else LLM graph plan, else deterministic fallback.
-    With top >= 3 the plan always covers kill, pause and cpu_stress (see diversify)."""
+    Data-loss kills rank first; with top >= 3 there are at least 3 different fault types (see diversify);
+    latency only with CHAOS_ALLOW_LATENCY=1."""
     if not os.environ.get("CHAOS_NO_CODE"):
         try:
             pln = code_review.to_plan(code_review.review(dep), dep, bas, centrality(dep), top)
@@ -208,7 +243,7 @@ def plan(dep, bas, top=3):
                 for exp in pln:
                     for rsk in code_review.risks_for(exp["id"])[:2]:
                         print(f"   {exp['id']} {exp['fault']} {exp['target']} <- {rsk['file']}:{rsk['line']}  {rsk['quote'][:70]}")
-                return diversify(_fill(pln, dep, top), dep, bas, top)
+                return diversify(no_latency(_fill(pln, dep, top)), dep, bas, top)
         except Exception as err:
             print(f"[planner] code review skipped ({str(err)[:160]})")
     try:
@@ -218,6 +253,6 @@ def plan(dep, bas, top=3):
     except Exception as err:
         print(f"[planner] LLM plan unavailable ({str(err)[:160]}); using deterministic fallback")
         pln = fallback(dep, top)
-    pln = diversify(pln, dep, bas, top)
+    pln = diversify(no_latency(pln), dep, bas, top)
     assert all(exp["fault"] in FAULTS for exp in pln)
     return pln
