@@ -147,7 +147,7 @@ def analyze(dep, bas, rsl, pln=None):
         got = llm.ask_json(SYS, prompt(dep, bas, rsl, pex), schema=schema(rsl),
                            check=lambda raw: validate(raw, bas, rsl, pex))
     except Exception as err:
-        print(f"[analyst] LLM analysis unavailable ({err}); using rule-based fallback")
+        print(f"[analyst] LLM analysis unavailable ({str(err)[:160]}); using rule-based fallback")
         return fallback(dep, bas, rsl, pln)
     print(f"[analyst] LLM analysis for {len(got)} experiments")
     fnd = []
