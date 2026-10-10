@@ -27,7 +27,7 @@ _cli = {"docker": None}
 _sku = {"val": None}
 _lod = {"ths": [], "stop": None, "pools": []}
 _lck = threading.Lock()
-_done = []  # (endpoint, ok, ms, kind, t_end)
+_done = []  # (endpoint, ok, ms, kind, t_end, t_start)
 _wait = {}  # token -> (endpoint, t_start)
 _tok = itertools.count()
 _drop = {nam: 0 for nam in EPS}  # requests not sent because CAP was reached
@@ -107,7 +107,7 @@ def _one(nam):
             _wait.pop(tok, None)
             _fly[nam] -= 1
     with _lck:
-        _done.append((nam, ok, (end - sta) * 1000, kind, end))
+        _done.append((nam, ok, (end - sta) * 1000, kind, end, sta))
 
 
 def _schedule(nam, pool, stp):
@@ -161,6 +161,15 @@ def _window(dur):
         pen = [(nam, None, (t_b - sta) * 1000, "pending") for nam, sta in _wait.values()]
         _done[:] = [row for row in _done if row[4] >= t_b - KEEP]
     return don, pen
+
+
+def sent_between(t_a, t_b):
+    """Rows for requests SENT in [t_a, t_b) (monotonic), each with its final outcome if it has one yet."""
+    now = time.monotonic()
+    with _lck:
+        don = [row[:4] for row in _done if t_a <= row[5] < t_b]
+        pen = [(nam, None, (now - sta) * 1000, "pending") for nam, sta in _wait.values() if t_a <= sta < t_b]
+    return don + pen
 
 
 def pct(vals, p):

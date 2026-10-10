@@ -230,6 +230,22 @@ class RunnerSafety(unittest.TestCase):
         self.assertIn("no errors", obs["catalogue"])
         self.assertGreater(int(obs["catalogue"].split("/")[1].split()[0]), 20)
 
+    def test_abort_counts_final_outcome_of_waiting_requests(self):
+        """Real run 3: guard aborted while all cart requests were still waiting; result said error_rate 0.0."""
+        tmo, baseline.TMO = baseline.TMO, 1.5
+        SHOP["hang"] = True
+        injector.inject = Fault()
+        try:
+            res = runner.run({**EXP, "params": {"duration_s": 30}}, BAS, AbortAt2s())
+        finally:
+            baseline.TMO = tmo
+        self._contract(res)
+        self.assertTrue(res["aborted"])
+        obs = {o.split(":")[0]: o for o in res["observations"]}
+        self.assertNotIn("no outcome", obs["cart_add"])
+        self.assertIn("timed out", obs["cart_add"])
+        self.assertGreater(res["error_rate"], 0.2)
+
     def test_revert_is_idempotent_with_guard(self):
         flt = Fault()
         injector.inject = flt

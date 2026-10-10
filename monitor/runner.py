@@ -56,8 +56,8 @@ def _observe(smps, agg, bas, tgt, abr, rec, rnm, err):
     obs = []
     if not smps:
         return [err] if err else ["no samples taken"]
-    obs.append(f"error_rate {bas['error_rate']} baseline -> {agg['error_rate']} during fault "
-               f"({agg['errors']}/{agg['requests']} requests failed)")
+    obs.append(f"error_rate {bas['error_rate']} baseline -> {agg['error_rate']} for requests sent during fault "
+               f"({agg['errors']}/{agg['requests']} failed, final outcomes)")
     obs.append(f"p95 {bas['p95_ms']}ms baseline -> {agg['p95_ms']}ms during fault")
     obs.append(f"{len(smps)} samples, last at t={smps[-1]['t']}s")
     for nam, eps in agg["endpoints"].items():
@@ -66,7 +66,7 @@ def _observe(smps, agg, bas, tgt, abr, rec, rnm, err):
         if eps["timeouts"]:
             txt += f" ({eps['timeouts']} timed out: no response within {baseline.TMO:g}s)"
         if eps["pending"]:
-            txt += f", {eps['pending']} still waiting for a response when the fault ended"
+            txt += f", {eps['pending']} still had no outcome {baseline.TMO:g}s after revert"
         if eps["dropped"]:
             txt += f", {eps['dropped']} not sent (load generator in-flight cap reached)"
         txt += f", p95 {eps['p95_ms']}ms"
@@ -110,7 +110,7 @@ def run(exp, bas, grd):
     -> revert on timeout or abort -> measure recovery_s -> return dict matching result.json."""
     tgt, dur = exp["target"], exp["params"]["duration_s"]
     sta = _now()
-    smps, raw, pen, abr, err, rec, rnm, rev = [], [], [], None, None, None, None, None
+    smps, raw, abr, err, rec, rnm, rev = [], [], None, None, None, None, None
     if hasattr(grd, "reset"):
         grd.reset()
     pre = baseline.sample(1.0)
@@ -129,13 +129,12 @@ def run(exp, bas, grd):
             while time.monotonic() - t0 < dur:
                 smp = baseline.sample(1.0)
                 smp["t"] = round(time.monotonic() - t0)
-                raw += smp.pop("_raw")
-                pen = smp.pop("_pending")
                 smps.append(smp)
                 abr = grd.check(smp, bas, tgt)
                 if abr:
                     break
         finally:
+            t_rev = time.monotonic()
             try:
                 rev()
                 if hasattr(grd, "unregister"):
@@ -143,7 +142,11 @@ def run(exp, bas, grd):
             except Exception as exc:
                 err = f"revert failed: {type(exc).__name__}: {exc}"
         rec, rnm = _recover(bas, tgt, grd)
-    agg = baseline.stats(raw + pen)  # requests still unanswered when the fault ended count as pending
+        # let requests sent during the fault reach their final outcome (answer or timeout)
+        while time.monotonic() < t_rev + baseline.TMO + 0.5 and not grd.kill_switch():
+            time.sleep(0.2)
+        raw = baseline.sent_between(t0, t_rev)
+    agg = baseline.stats(raw)  # every request sent while the fault was active, with its final outcome
     res = {"id": exp["id"], "target": tgt, "fault": exp["fault"], "started_at": sta, "ended_at": _now(),
            "error_rate": agg["error_rate"] if raw else None, "p95_ms": agg["p95_ms"] if raw else None,
            "recovery_s": rec, "aborted": bool(abr or err), "abort_reason": abr or err,
