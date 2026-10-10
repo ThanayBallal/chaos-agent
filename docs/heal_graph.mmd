@@ -1,0 +1,45 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	understand(understand)
+	chaos_agent(chaos_agent)
+	guard_approve(guard_approve)
+	inject(inject)
+	observe(observe)
+	diagnosis_agent(diagnosis_agent)
+	remediation_agent(remediation_agent)
+	apply_fix(apply_fix)
+	verify(verify)
+	guard_revert(guard_revert)
+	harden_agent(harden_agent)
+	apply_hardening(apply_hardening)
+	rerun(rerun)
+	compare(compare)
+	report(report)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> understand;
+	apply_fix --> verify;
+	apply_hardening --> rerun;
+	chaos_agent --> guard_approve;
+	compare --> guard_revert;
+	diagnosis_agent --> remediation_agent;
+	guard_approve -. &nbsp;approved&nbsp; .-> inject;
+	guard_approve -. &nbsp;rejected&nbsp; .-> report;
+	guard_revert --> report;
+	harden_agent --> apply_hardening;
+	inject --> observe;
+	observe --> diagnosis_agent;
+	remediation_agent --> apply_fix;
+	rerun --> compare;
+	understand --> chaos_agent;
+	verify -. &nbsp;give_up&nbsp; .-> guard_revert;
+	verify -. &nbsp;healed&nbsp; .-> harden_agent;
+	verify -. &nbsp;retry&nbsp; .-> observe;
+	report --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
