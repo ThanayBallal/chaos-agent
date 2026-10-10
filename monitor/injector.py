@@ -25,14 +25,15 @@ def container(svc):
 
 
 def _once(fnc):
-    """Make a revert idempotent: runner, guard and Ctrl+C may all call it."""
+    """Make a revert idempotent: runner, guard and Ctrl+C may all call it.
+    Marked done only after it succeeds, so a failed revert can be retried."""
     don = {"v": False}
 
     def rev():
         if don["v"]:
             return
-        don["v"] = True
         fnc()
+        don["v"] = True
 
     return rev
 

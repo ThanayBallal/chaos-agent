@@ -70,7 +70,13 @@ def _observe(smps, agg, bas, tgt, abr, rec, rnm, err):
         if eps["dropped"]:
             txt += f", {eps['dropped']} not sent (load generator in-flight cap reached)"
         txt += f", p95 {eps['p95_ms']}ms"
-        obs.append(txt + (f", first error in sample ending t={fst}s" if fst is not None else ", no errors"))
+        if fst is not None:
+            txt += f", first error in sample ending t={fst}s"
+        elif eps["errors"]:
+            txt += ", all failures arrived after the last fault sample"
+        else:
+            txt += ", no errors"
+        obs.append(txt)
     seen = {}
     for smp in smps:
         for svc, sta in smp["health"].items():
@@ -120,10 +126,17 @@ def run(exp, bas, grd):
     else:
         try:
             rev = injector.inject(exp)
+            _register(grd, rev, exp)
         except Exception as exc:
             err = f"injection failed: {type(exc).__name__}: {exc}"
+            if rev:  # injected but register failed: undo now
+                rev()
+                rev = None
+        except BaseException:  # Ctrl+C / SystemExit between inject and register
+            if rev:
+                rev()
+            raise
     if rev:
-        _register(grd, rev, exp)
         t0 = time.monotonic()
         try:
             while time.monotonic() - t0 < dur:
