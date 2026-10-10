@@ -13,11 +13,12 @@ from monitor import baseline, injector, runner
 from safety import guard
 
 RES_KEYS = {"id", "target", "fault", "started_at", "ended_at", "error_rate", "p95_ms", "recovery_s",
-            "aborted", "abort_reason", "observations"}
+            "aborted", "abort_reason", "data_survived", "observations"}
 BAS = {"window_s": 2, "requests": 100, "error_rate": 0.0, "p50_ms": 5, "p95_ms": 10,
        "health": {"redis": "healthy", "cart": "healthy"}, "captured_at": "TEST"}
 EXP = {"id": "e1", "target": "redis", "fault": "kill", "params": {"duration_s": 3}}
-SHOP = {"redis": "healthy", "cart": "healthy", "hang": False}
+SHOP = {"redis": "healthy", "cart": "healthy", "hang": False, "add_broken": False}
+CARTS = {}  # cart id -> {sku: qty}; lives "in redis", so a wiping fault can empty it
 
 
 class Shop(BaseHTTPRequestHandler):
@@ -37,8 +38,23 @@ class Shop(BaseHTTPRequestHandler):
         if self.path.startswith("/api/cart/add"):
             if SHOP["hang"] and SHOP["redis"] != "healthy":
                 time.sleep(3)  # like real cart with redis gone: no answer
-            return self._send(200 if SHOP["redis"] == "healthy" else 500, {})
+            cid, sku, qty = self.path.split("/")[4:7]
+            if SHOP["redis"] != "healthy" or (SHOP["add_broken"] and cid.startswith("chaos-probe")):
+                return self._send(500, {})
+            CARTS.setdefault(cid, {})[sku] = CARTS.get(cid, {}).get(sku, 0) + int(qty)
+            return self._send(200, {})
+        if self.path.startswith("/api/cart/cart/"):
+            if SHOP["redis"] != "healthy":
+                return self._send(500, {})
+            cid = self.path.split("/")[4]
+            if cid not in CARTS:
+                return self._send(404, "cart not found")
+            return self._send(200, {"items": [{"sku": sku, "qty": qty} for sku, qty in CARTS[cid].items()]})
         self._send(200, [{"sku": "Watson"}])
+
+    def do_DELETE(self):
+        CARTS.pop(self.path.split("/")[4], None)
+        self._send(200, {})
 
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -48,14 +64,17 @@ class Shop(BaseHTTPRequestHandler):
 class Fault:
     """Fake injector: 'kills' redis in the fake shop and counts reverts."""
 
-    def __init__(self, fail=False, on_inject=None):
+    def __init__(self, fail=False, on_inject=None, wipe=False):
         self.fail, self.on_inject, self.injected, self.reverts = fail, on_inject, 0, 0
+        self.wipe = wipe  # True: like redis without persistence, a crash loses every cart
 
     def __call__(self, exp):
         if self.fail:
             raise RuntimeError("docker said no")
         self.injected += 1
         SHOP["redis"] = "unhealthy"
+        if self.wipe:
+            CARTS.clear()
         if self.on_inject:
             self.on_inject()
 
@@ -131,7 +150,8 @@ class RunnerSafety(unittest.TestCase):
 
     def setUp(self):
         baseline.stop()  # fresh traffic generation: nothing from the previous test leaks in
-        SHOP.update(redis="healthy", cart="healthy", hang=False)
+        SHOP.update(redis="healthy", cart="healthy", hang=False, add_broken=False)
+        CARTS.clear()
         guard.STP.unlink(missing_ok=True)
         guard.revert_all()
         guard.reset() if hasattr(guard, "reset") else guard._brc.update(since=None)
@@ -347,6 +367,31 @@ class RunnerSafety(unittest.TestCase):
         rev = injector._cpu(Con(), {"cpus": 1})
         with self.assertRaisesRegex(RuntimeError, "still running"):
             rev()
+
+    def test_cart_survives_when_data_persists(self):
+        injector.inject = Fault()
+        res = runner.run({**EXP, "params": {"duration_s": 2}}, BAS, AbortAt2s())
+        self._contract(res)
+        self.assertIs(res["data_survived"], True)
+        self.assertTrue(any("cart probe" in o and "still there" in o for o in res["observations"]))
+        self.assertFalse([cid for cid in CARTS if cid.startswith("chaos-probe")])  # probe cart cleaned up
+
+    def test_cart_lost_when_crash_wipes_data(self):
+        injector.inject = Fault(wipe=True)
+        res = runner.run({**EXP, "params": {"duration_s": 2}}, BAS, AbortAt2s())
+        self._contract(res)
+        self.assertIs(res["data_survived"], False)
+        self.assertTrue(any("cart probe" in o and "gone" in o and "HTTP 404" in o for o in res["observations"]))
+
+    def test_cart_probe_not_run_gives_null(self):
+        SHOP["add_broken"] = True
+        flt = Fault()
+        injector.inject = flt
+        res = runner.run({**EXP, "params": {"duration_s": 2}}, BAS, AbortAt2s())
+        self._contract(res)
+        self.assertIsNone(res["data_survived"])
+        self.assertEqual(flt.reverts, 1)  # the experiment itself still ran
+        self.assertTrue(any(o.startswith("cart probe not run: add returned HTTP 500") for o in res["observations"]))
 
     def test_revert_is_idempotent_with_guard(self):
         flt = Fault()
