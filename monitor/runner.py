@@ -67,6 +67,8 @@ def _observe(smps, agg, bas, tgt, abr, rec, rnm, err):
             txt += f" ({eps['timeouts']} timed out: no response within {baseline.TMO:g}s)"
         if eps["pending"]:
             txt += f", {eps['pending']} still waiting for a response when the fault ended"
+        if eps["dropped"]:
+            txt += f", {eps['dropped']} not sent (load generator in-flight cap reached)"
         txt += f", p95 {eps['p95_ms']}ms"
         obs.append(txt + (f", first error in sample ending t={fst}s" if fst is not None else ", no errors"))
     seen = {}

@@ -1,10 +1,12 @@
 """P3: capture steady-state metrics under load.
-Traffic runs in background workers, one group per endpoint, so a hanging endpoint never blocks the
-1 s sampling cadence or the traffic to other endpoints."""
+Traffic is fixed-rate (open loop): each endpoint gets RATE requests per second on schedule, whether or not
+earlier ones have answered, like real users. A hanging endpoint therefore shows its true failure share, and
+never blocks the 1 s sampling cadence or the traffic to other endpoints."""
 import itertools
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -13,9 +15,9 @@ import requests
 URL = "http://localhost:8080"
 PRJ = "robot-shop"
 EPS = ("catalogue", "cart_add", "login")
-WPE = 2  # workers per endpoint
-GAP = 0.1  # min seconds between requests per worker (~10 req/s/worker)
+RATE = 10  # requests per second per endpoint
 TMO = 6.0  # per-request timeout; above guard P95_MAX so a 5000 ms wait is observable
+CAP = int(2 * RATE * TMO)  # max in flight per endpoint (2x what RATE x TMO needs); beyond it requests are dropped, not sent
 KEEP = 300  # seconds of completed rows kept in memory
 USR = {"name": "user", "password": "password"}  # robot-shop seeded user
 SKU = "Watson"  # fallback sku if catalogue cannot be read
@@ -23,11 +25,14 @@ DAT = Path(__file__).resolve().parent.parent / "data"
 
 _cli = {"docker": None}
 _sku = {"val": None}
-_lod = {"ths": [], "stop": None}
+_lod = {"ths": [], "stop": None, "pools": []}
 _lck = threading.Lock()
 _done = []  # (endpoint, ok, ms, kind, t_end)
 _wait = {}  # token -> (endpoint, t_start)
 _tok = itertools.count()
+_drop = {nam: 0 for nam in EPS}  # requests not sent because CAP was reached
+_fly = {nam: 0 for nam in EPS}
+_ses = threading.local()
 
 
 def _docker():
@@ -86,18 +91,40 @@ def _hit(ses, nam, wid):
     return ok, "ok" if ok else f"http_{rsp.status_code}"
 
 
-def _worker(nam, wid, stp):
-    ses = requests.Session()
-    while not stp.is_set():
-        tok, sta = next(_tok), time.monotonic()
-        with _lck:
-            _wait[tok] = (nam, sta)
-        ok, kind = _hit(ses, nam, wid)
+def _one(nam):
+    """Send one request on a pool thread and record it."""
+    if not hasattr(_ses, "s"):
+        _ses.s = requests.Session()
+    tok, sta = next(_tok), time.monotonic()
+    ok, kind = False, "client_error"
+    with _lck:
+        _wait[tok] = (nam, sta)
+    try:
+        ok, kind = _hit(_ses.s, nam, threading.get_ident() % 8)
+    finally:
         end = time.monotonic()
         with _lck:
             _wait.pop(tok, None)
-            _done.append((nam, ok, (end - sta) * 1000, kind, end))
-        stp.wait(max(0.0, GAP - (end - sta)))
+            _fly[nam] -= 1
+    with _lck:
+        _done.append((nam, ok, (end - sta) * 1000, kind, end))
+
+
+def _schedule(nam, pool, stp):
+    """Submit RATE requests per second for endpoint nam until stopped."""
+    nxt = time.monotonic()
+    while not stp.is_set():
+        with _lck:
+            full = _fly[nam] >= CAP
+            if not full:
+                _fly[nam] += 1
+        if full:
+            with _lck:
+                _drop[nam] += 1
+        else:
+            pool.submit(_one, nam)
+        nxt += 1 / RATE
+        stp.wait(max(0.0, nxt - time.monotonic()))
 
 
 def start():
@@ -105,18 +132,20 @@ def start():
     if _lod["ths"] and all(thd.is_alive() for thd in _lod["ths"]):
         return
     stp = threading.Event()
-    ths = [threading.Thread(target=_worker, args=(nam, f"{nam}-{num}", stp), daemon=True)
-           for nam in EPS for num in range(WPE)]
+    pools = [ThreadPoolExecutor(max_workers=CAP, thread_name_prefix=f"load-{nam}") for nam in EPS]
+    ths = [threading.Thread(target=_schedule, args=(nam, pool, stp), daemon=True) for nam, pool in zip(EPS, pools)]
     for thd in ths:
         thd.start()
-    _lod.update(ths=ths, stop=stp)
+    _lod.update(ths=ths, stop=stp, pools=pools)
 
 
 def stop():
-    """Stop background traffic (workers exit after their current request)."""
+    """Stop background traffic. Requests already sent finish (or time out) on their own."""
     if _lod["stop"]:
         _lod["stop"].set()
-    _lod.update(ths=[], stop=None)
+    for pool in _lod["pools"]:
+        pool.shutdown(wait=False, cancel_futures=True)
+    _lod.update(ths=[], stop=None, pools=[])
 
 
 def _window(dur):
@@ -127,6 +156,8 @@ def _window(dur):
     t_b = time.monotonic()
     with _lck:
         don = [row[:4] for row in _done if t_a <= row[4] < t_b]
+        don += [(nam, None, 0, "dropped") for nam in EPS for _ in range(_drop[nam])]
+        _drop.update({nam: 0 for nam in EPS})
         pen = [(nam, None, (t_b - sta) * 1000, "pending") for nam, sta in _wait.values()]
         _done[:] = [row for row in _done if row[4] >= t_b - KEEP]
     return don, pen
@@ -142,7 +173,10 @@ def pct(vals, p):
 
 def stats(raw):
     """Aggregate [(endpoint, ok, ms, kind)] into totals plus per-endpoint numbers.
-    kind 'pending' = no response yet: counts toward latency (as a lower bound), not as an error."""
+    kind 'pending' = no response yet: counts toward latency (as a lower bound), not as an error.
+    kind 'dropped' = not sent because our own in-flight cap was hit: excluded from all rates, only counted."""
+    drp = [row for row in raw if row[3] == "dropped"]
+    raw = [row for row in raw if row[3] != "dropped"]
     lat = [ms for _, _, ms, _ in raw]
     err = sum(1 for _, ok, _, _ in raw if ok is False)
     eps = {}
@@ -152,6 +186,7 @@ def stats(raw):
         eps[nam] = {"requests": len(sub), "errors": bad,
                     "timeouts": sum(1 for row in sub if row[3] == "timeout"),
                     "pending": sum(1 for row in sub if row[3] == "pending"),
+                    "dropped": sum(1 for row in drp if row[0] == nam),
                     "error_rate": round(bad / len(sub), 3) if sub else 0.0,
                     "p95_ms": pct([row[2] for row in sub], 95)}
     return {"requests": len(raw), "errors": err,

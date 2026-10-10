@@ -224,6 +224,9 @@ class RunnerSafety(unittest.TestCase):
         self.assertEqual(ts, [1, 2, 3, 4])
         obs = {o.split(":")[0]: o for o in res["observations"]}
         self.assertIn("timed out", obs["cart_add"])
+        cart = int(obs["cart_add"].split(":")[1].split("/")[0])
+        self.assertGreaterEqual(cart, 15)  # fixed rate: cart keeps being clicked while it hangs
+        self.assertGreater(res["error_rate"], 0.15)  # true failure share, not diluted by fewer cart requests
         self.assertIn("no errors", obs["catalogue"])
         self.assertGreater(int(obs["catalogue"].split("/")[1].split()[0]), 20)
 
