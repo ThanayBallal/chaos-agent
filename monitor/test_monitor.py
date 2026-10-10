@@ -30,7 +30,7 @@ class Shop(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(body).encode())
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:  # BrokenPipe, ConnectionReset, ConnectionAborted (Windows)
             pass  # client already timed out
 
     def do_GET(self):
