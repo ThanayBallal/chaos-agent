@@ -164,6 +164,8 @@ def run(exp, bas, grd):
            "error_rate": agg["error_rate"] if raw else None, "p95_ms": agg["p95_ms"] if raw else None,
            "recovery_s": rec, "aborted": bool(abr or err), "abort_reason": abr or err,
            "observations": _observe(smps, agg, bas, tgt, abr, rec, rnm, err)}
+    if rev is not None and getattr(rev, "info", ""):
+        res["observations"].insert(0, f"fault applied: {rev.info}")
     _save(res)
     return res
 

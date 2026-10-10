@@ -298,6 +298,56 @@ class RunnerSafety(unittest.TestCase):
         finally:
             baseline.DAT = out
 
+    def test_kill_is_sigkill_crash_with_fallback(self):
+        """Kill must be SIGKILL (no graceful save). Helper crash first, docker kill SIGKILL as fallback."""
+        sig = []
+
+        class Con:
+            attrs = {"State": {"Pid": 42}}
+            status, name = "running", "redis"
+
+            def kill(self, signal=None):
+                sig.append(signal)
+                self.status = "exited"
+
+            def reload(self):
+                pass
+
+            def start(self):
+                self.status = "running"
+
+        hlp, injector._helper = injector._helper, lambda cmd, **kw: (_ for _ in ()).throw(RuntimeError("no pid=host"))
+        try:
+            con = Con()
+            rev = injector._kill(con, {})
+            self.assertEqual(sig, ["SIGKILL"])
+            self.assertIn("docker kill SIGKILL", rev.info)
+            rev()
+            self.assertEqual(con.status, "running")
+            seen = []
+            injector._helper = lambda cmd, **kw: seen.append((cmd, kw))
+            rev = injector._kill(Con(), {})
+            self.assertEqual(seen[0][0], ["kill", "-KILL", "42"])
+            self.assertEqual(seen[0][1], {"pid_mode": "host"})
+            self.assertIn("crash", rev.info)
+        finally:
+            injector._helper = hlp
+
+    def test_cpu_revert_fails_loudly_if_loops_survive(self):
+        class Con:
+            status = "running"
+
+            def reload(self):
+                pass
+
+            def exec_run(self, cmd):
+                from types import SimpleNamespace
+                return SimpleNamespace(exit_code=1 if "kill -9" in cmd[-1] else 0, output=b"alive 7")
+
+        rev = injector._cpu(Con(), {"cpus": 1})
+        with self.assertRaisesRegex(RuntimeError, "still running"):
+            rev()
+
     def test_revert_is_idempotent_with_guard(self):
         flt = Fault()
         injector.inject = flt
