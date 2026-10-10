@@ -17,7 +17,9 @@ HARDEN_TAIL = ["harden_agent", "apply_hardening", "rerun", "compare"]
 
 @pytest.fixture(autouse=True)
 def calls(monkeypatch):
-    """Wrap every port so tests can see what each node passed and in which order (the stub still runs)."""
+    """Wrap every port so tests can see what each node passed and in which order (the stub still runs).
+    CHAOS_NO_LLM: the agents use their rule-based fallbacks, never a real LLM (even with a key in .env)."""
+    monkeypatch.setenv("CHAOS_NO_LLM", "1")
     cal = {nam: [] for nam in ports.REAL}
     cal["_order"] = []
     for nam in ports.REAL:
