@@ -76,82 +76,93 @@ class Isolated(unittest.TestCase):
         self.tmp.cleanup()
 
 
+RISK_PUB = {"service": "payment", "dependency": "rabbitmq", "file": "payment/payment.py", "line": 120,
+            "quote": "publisher.publish(order)", "fault": "kill",
+            "weakness": "the order is published before the cart delete that can still fail",
+            "fix": "publish only after the cart delete succeeds", "weight": 2}
+
+
+def evd(rec="recovery 14s", loss=False):
+    return f"error_rate 0.004 -> 0.62, p95 180 -> 2400ms, {rec}" + (", data_survived false" if loss else "")
+
+
 class Patcher(Isolated):
-    def test_redis_state_loss_gets_aof_volume_and_restart(self):
+    def make(self, fnd, pln):
+        return patcher.make({"findings": fnd}, pln, DEP)
+
+    def test_redis_state_loss_gives_redis_aof(self):
         code_review.LAST["e1"] = [RISK_STATE]
-        pch = patcher.make({"findings": [finding(1, "e1", "redis")]}, [exp("e1", "redis", "kill")], DEP)
-        red = pch["override"]["services"]["redis"]
-        self.assertEqual(red["restart"], "unless-stopped")
-        self.assertEqual(red["command"], ["redis-server", "--appendonly", "yes"])
-        self.assertEqual(red["volumes"], ["redis-data:/data"])
-        self.assertEqual(pch["override"]["volumes"], {"redis-data": {}})
-        self.assertEqual(pch["source"], "template")
-        self.assertIn({"finding": 1, "service": "cart", "file": "cart/server.js", "line": 379,
-                       "suggestion": RISK_STATE["fix"]}, pch["code_suggestions"])
+        pch = self.make([dict(finding(1, "e1", "redis"), evidence=evd("recovery 4s"))], [exp("e1", "redis", "kill")])
+        self.assertEqual([(itm["id"], itm["fix"], itm["service"], itm["experiment"]) for itm in pch["patches"]],
+                         [("p1", "redis_aof", "redis", "e1")])
+        self.assertTrue(pch["patches"][0]["reason"].startswith("cart/server.js:379"))
+        self.assertEqual(set(pch["patches"][0]), {"id", "experiment", "service", "fix", "reason", "expected"})
+        self.assertEqual(pch["code_suggestions"], [])  # the state-loss weakness is covered by the live patch
         self.assertEqual(json.loads(patcher.OUT.read_text()), pch)
 
-    def test_stale_health_flag_gets_restart_and_healthcheck(self):
-        code_review.LAST["e1"] = [RISK_FLAG]
-        pch = patcher.make({"findings": [finding(1, "e1", "mongodb")]}, [exp("e1", "mongodb", "kill")], DEP)
-        mgo = pch["override"]["services"]["mongodb"]
-        self.assertEqual(mgo["restart"], "unless-stopped")
-        self.assertEqual(mgo["healthcheck"]["test"][0], "CMD")
-        self.assertNotIn("command", mgo)
+    def test_data_survived_false_on_redis_gives_redis_aof_without_code_review(self):
+        fnd = [dict(finding(1, "e1", "redis", "Data loss: carts did not survive"), evidence=evd("recovery 4s", True))]
+        pch = self.make(fnd, [exp("e1", "redis", "kill")])
+        self.assertEqual([itm["fix"] for itm in pch["patches"]], ["redis_aof"])
 
-    def test_missing_timeout_is_only_a_code_suggestion(self):
-        code_review.LAST["e1"] = [RISK_TMO]
-        pch = patcher.make({"findings": [finding(1, "e1", "user")]}, [exp("e1", "user", "pause")], DEP)
-        self.assertEqual(pch["changes"], [])
-        self.assertEqual([(sug["file"], sug["line"]) for sug in pch["code_suggestions"]], [("payment/payment.py", 64)])
+    def test_killed_dependency_with_slow_or_no_recovery_gets_restart_policy(self):
+        pln = [exp("e1", "mongodb", "kill"), exp("e2", "rabbitmq", "kill"), exp("e3", "catalogue", "kill"),
+               exp("e4", "user", "pause")]
+        fnd = [dict(finding(1, "e1", "mongodb"), evidence=evd("recovery 22s")),
+               dict(finding(2, "e2", "rabbitmq"), evidence=evd("no recovery measured")),
+               dict(finding(3, "e3", "catalogue"), evidence=evd("recovery 4s")),
+               dict(finding(4, "e4", "user"), evidence=evd("no recovery measured"))]
+        pch = self.make(fnd, pln)
+        self.assertEqual([(itm["fix"], itm["service"]) for itm in pch["patches"]],
+                         [("restart_policy", "mongodb"), ("restart_policy", "rabbitmq")])
+        self.assertIn("22s", pch["patches"][0]["reason"])
 
-    def test_data_loss_finding_without_risks_still_persists(self):
-        fnd = {"findings": [finding(1, "e1", "redis", "Data loss: carts did not survive the kill")]}
-        pch = patcher.make(fnd, [exp("e1", "redis", "kill")], DEP)
-        self.assertIn("redis-data:/data", pch["override"]["services"]["redis"]["volumes"])
+    def test_code_weaknesses_become_code_suggestions(self):
+        code_review.LAST.update(e1=[RISK_FLAG], e2=[RISK_TMO], e3=[RISK_PUB])
+        pln = [exp("e1", "mongodb", "kill"), exp("e2", "user", "pause"), exp("e3", "rabbitmq", "kill")]
+        fnd = [dict(finding(idx, f"e{idx}", tgt), evidence=evd("recovery 4s"))
+               for idx, tgt in ((1, "mongodb"), (2, "user"), (3, "rabbitmq"))]
+        pch = self.make(fnd, pln)
+        self.assertEqual(pch["patches"], [])
+        self.assertEqual({(itm["file"], itm["line"]) for itm in pch["code_suggestions"]},
+                         {("catalogue/server.js", 173), ("payment/payment.py", 64), ("payment/payment.py", 120)})
+        for itm in pch["code_suggestions"]:
+            self.assertEqual(set(itm), {"file", "line", "suggestion"})
 
-    def test_templates_only_use_allowed_keys_and_known_services(self):
-        code_review.LAST.update(e1=[RISK_STATE], e2=[RISK_FLAG], e3=[RISK_TMO])
-        fnd = {"findings": [finding(1, "e1", "redis"), finding(2, "e2", "mongodb"), finding(3, "e3", "user")]}
-        pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "kill"), exp("e3", "user", "pause")]
-        nam = {svc["name"] for svc in DEP["services"]}
-        for chg in patcher.make(fnd, pln, DEP)["changes"]:
-            self.assertLessEqual(set(chg["set"]), set(patcher.ALLOWED))
-            self.assertIn(chg["service"], nam)
-            patcher.check_set(chg["set"])
-
-    def test_validate_rejects_unsafe_llm_output(self):
-        code_review.LAST["e1"] = [RISK_STATE]
-        fnd, pln = {"findings": [finding(1, "e1", "redis")]}, [exp("e1", "redis", "kill")]
-        ok = {"finding": 1, "service": "redis", "set": {"restart": "unless-stopped"}, "why": "w"}
-        bad = [dict(ok, set={"ports": ["6379:6379"]}),
-               dict(ok, service="nginx"),
-               dict(ok, set={"volumes": ["/var/lib/host:/data"]}),
-               dict(ok, set={"restart": "sometimes"}),
-               dict(ok, set={"environment": ["not an assignment"]}),
-               dict(ok, set={"healthcheck": {"test": ["redis-cli", "ping"]}}),
-               dict(ok, finding=9)]
-        for chg in bad:
-            with self.assertRaises(ValueError, msg=chg):
-                patcher.validate({"changes": [chg], "code_suggestions": []}, fnd, pln, DEP)
-        with self.assertRaises(ValueError):
-            patcher.validate({"changes": [ok], "code_suggestions": [
-                {"finding": 1, "service": "cart", "file": "cart/server.js", "line": 1, "suggestion": "s"}]},
-                fnd, pln, DEP)
-        chg, sug = patcher.validate({"changes": [ok], "code_suggestions": [
-            {"finding": 1, "service": "cart", "file": "cart/server.js", "line": 379, "suggestion": "s"}]},
-            fnd, pln, DEP)
-        self.assertEqual(chg[0]["experiment"], "e1")
-        self.assertEqual(sug[0]["line"], 379)
-
-    def test_llm_path_is_used_when_valid(self):
-        rep = {"changes": [{"finding": 1, "service": "redis", "why": "w",
-                            "set": {"restart": "unless-stopped", "volumes": ["redis-data:/data"]}}],
-               "code_suggestions": []}
+    def test_llm_wording_kept_and_invalid_items_dropped(self):
+        code_review.LAST["e1"] = [RISK_STATE, RISK_FLAG]
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("no recovery measured"))]
+        rep = {"patches": [
+            {"experiment": "e1", "service": "redis", "fix": "redis_aof", "reason": "LLM reason", "expected": "LLM exp"},
+            {"experiment": "e1", "service": "redis", "fix": "add_replica", "reason": "r", "expected": "e"},
+            {"experiment": "e1", "service": "nginx", "fix": "restart_policy", "reason": "r", "expected": "e"},
+            {"experiment": "e1", "service": "mongodb", "fix": "restart_policy", "reason": "r", "expected": "e"},
+            {"experiment": "e1", "service": "mongodb", "fix": "redis_aof", "reason": "r", "expected": "e"}],
+            "code_suggestions": [
+            {"file": "catalogue/server.js", "line": 173, "suggestion": "LLM: reset mongoConnected on close"},
+            {"file": "cart/server.js", "line": 1, "suggestion": "uncited line"}]}
         fake = lambda sp, up, schema=None, check=None, **kw: check(rep)
         with mock.patch.object(patcher.llm, "ask_json", fake):
-            pch = patcher.make({"findings": [finding(1, "e1", "redis")]}, [exp("e1", "redis", "kill")], DEP)
-        self.assertEqual(pch["source"], "llm")
-        self.assertEqual(pch["override"]["volumes"], {"redis-data": {}})
+            pch = self.make(fnd, [exp("e1", "redis", "kill")])
+        got = {(itm["fix"], itm["service"]): itm for itm in pch["patches"]}
+        self.assertEqual(set(got), {("redis_aof", "redis"), ("restart_policy", "redis")})  # only rule-eligible ones
+        self.assertEqual(got[("redis_aof", "redis")]["reason"], "LLM reason")
+        self.assertNotEqual(got[("restart_policy", "redis")]["reason"], "r")  # filled from the template
+        self.assertEqual([(itm["file"], itm["line"], itm["suggestion"]) for itm in pch["code_suggestions"]],
+                         [("catalogue/server.js", 173, "LLM: reset mongoConnected on close")])
+
+    def test_every_patch_uses_the_fix_allowlist_and_depmap_services(self):
+        code_review.LAST.update(e1=[RISK_STATE], e2=[RISK_FLAG])
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("no recovery measured", True)),
+               dict(finding(2, "e2", "mongodb"), evidence=evd("recovery 30s"))]
+        pch = self.make(fnd, [exp("e1", "redis", "kill"), exp("e2", "mongodb", "kill")])
+        nam = {svc["name"] for svc in DEP["services"]}
+        self.assertTrue(pch["patches"])
+        for itm in pch["patches"]:
+            self.assertIn(itm["fix"], patcher.FIXES)
+            self.assertIn(itm["service"], nam)
+        self.assertNotIn("override", pch)
+        self.assertEqual([itm["id"] for itm in pch["patches"]], [f"p{idx}" for idx in range(1, len(pch["patches"]) + 1)])
 
 
 class Planner(Isolated):
