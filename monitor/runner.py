@@ -126,10 +126,17 @@ def run(exp, bas, grd):
     else:
         try:
             rev = injector.inject(exp)
+            _register(grd, rev, exp)
         except Exception as exc:
             err = f"injection failed: {type(exc).__name__}: {exc}"
+            if rev:  # injected but register failed: undo now
+                rev()
+                rev = None
+        except BaseException:  # Ctrl+C / SystemExit between inject and register
+            if rev:
+                rev()
+            raise
     if rev:
-        _register(grd, rev, exp)
         t0 = time.monotonic()
         try:
             while time.monotonic() - t0 < dur:

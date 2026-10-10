@@ -247,6 +247,56 @@ class RunnerSafety(unittest.TestCase):
         self.assertIn("timed out", obs["cart_add"])
         self.assertGreater(res["error_rate"], 0.2)
 
+    def test_failed_revert_can_be_retried(self):
+        """H1: a revert that raises must not be marked done."""
+        cnt = {"n": 0}
+
+        def flaky():
+            cnt["n"] += 1
+            if cnt["n"] == 1:
+                raise RuntimeError("docker busy")
+        rev = injector._once(flaky)
+        with self.assertRaises(RuntimeError):
+            rev()
+        rev()
+        rev()
+        self.assertEqual(cnt["n"], 2)
+
+    def test_interrupt_between_inject_and_register_reverts(self):
+        """M2: Ctrl+C right after inject, before register, still reverts."""
+        flt = Fault()
+        injector.inject = flt
+
+        class Boom(AbortAt2s):
+            def register(self, fnc):
+                raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            runner.run(EXP, BAS, Boom())
+        self.assertEqual(flt.reverts, 1)
+        self.assertEqual(SHOP["redis"], "healthy")
+
+    def test_capture_refuses_bad_baseline(self):
+        """M5: unhealthy service or zero requests -> raise, never write a baseline."""
+        out, baseline.DAT = baseline.DAT, Path(self.tmp.name)
+        try:
+            SHOP["cart"] = "unhealthy"
+            with self.assertRaisesRegex(RuntimeError, "not healthy: cart"):
+                baseline.capture(1)
+            SHOP["cart"] = "healthy"
+            url, baseline.URL = baseline.URL, "http://127.0.0.1:9"
+            baseline.stop()
+            baseline.TMO, tmo = 0.2, baseline.TMO
+            try:
+                with self.assertRaises(RuntimeError):
+                    baseline.capture(1)
+            finally:
+                baseline.URL, baseline.TMO = url, tmo
+                baseline.stop()
+            self.assertFalse((Path(self.tmp.name) / "baseline.json").exists())
+        finally:
+            baseline.DAT = out
+
     def test_revert_is_idempotent_with_guard(self):
         flt = Fault()
         injector.inject = flt

@@ -213,11 +213,18 @@ def sample(dur=1.0):
 
 def capture(win=120):
     """Return a dict matching contracts.md baseline.json and save it to data/baseline.json.
-    Traffic only: never injects a fault."""
+    Traffic only: never injects a fault. Raises RuntimeError if no request succeeded or any service
+    is not healthy (or health cannot be read), so no experiment runs against a bad baseline."""
     don, _ = _window(win)
     sta = stats(don)
+    hlt = health()
+    if sta["requests"] == sta["errors"]:
+        raise RuntimeError(f"baseline: 0 successful requests ({sta['requests']} sent) in {win}s - is {URL} up?")
+    bad = sorted(svc for svc, val in hlt.items() if val != "healthy")
+    if not hlt or bad:
+        raise RuntimeError(f"baseline: services not healthy: {', '.join(bad) or 'health unavailable (docker?)'}")
     bas = {"window_s": win, "requests": sta["requests"], "error_rate": sta["error_rate"],
-           "p50_ms": sta["p50_ms"], "p95_ms": sta["p95_ms"], "health": health(),
+           "p50_ms": sta["p50_ms"], "p95_ms": sta["p95_ms"], "health": hlt,
            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds")}
     (DAT / "baseline.json").write_text(json.dumps(bas, indent=2))
     return bas
