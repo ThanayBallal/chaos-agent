@@ -22,6 +22,7 @@ from safety.allowlist import MAX_DUR
 HEAL_S = MAX_DUR  # hard heal deadline, seconds from injection
 VERIFY_S = 20  # max seconds one verify waits for steady state (leaves time for a second attempt)
 READY_S = 30  # max seconds to wait for steady state before injecting
+PROBE_SETTLE_S = 3  # after creating the probe cart, so redis (save "1 1") has snapshotted it before a crash
 DEP = graph.DAT / "depmap.json"
 MSD = ("window_s", "requests", "errors", "p50_ms", "endpoints", "health", "unhealthy", "containers", "cpu_pct", "netem",
        "logs")
@@ -49,13 +50,15 @@ def _steady(bas):
 
 
 def _start(exp, bas):
-    """Steady-state check -> cart probe -> ports.inject. Return (heal dict, abort reason or None)."""
+    """Steady-state check -> cart probe -> PROBE_SETTLE_S pause -> ports.inject. Return (heal dict, abort reason or
+    None)."""
     guard.reset()
     why = _steady(bas)
     if why:
         return {}, f"not injected: {why}"
     cid = f"chaos-heal-{exp['id']}-{int(time.time())}"
     sku, pnr = runner._probe_create(cid)
+    time.sleep(PROBE_SETTLE_S)
     sta = runner._now()
     res = ports.inject(exp)
     t_0 = time.monotonic()

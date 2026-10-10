@@ -46,3 +46,6 @@ Only containers in the `robot-shop` Compose project can be targeted; faults are 
 
 ## Team
 See `TEAM.md`. Tools, AI models and third-party libraries used: _fill in before submission_.
+
+## Dashboard
+Run `streamlit run ui/app.py` from the repository root to view the latest heal summary, before-and-after resilience results, code-review findings, dependency evidence, and graph path.
