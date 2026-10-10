@@ -8,6 +8,10 @@ import sys
 from heal import graph
 
 
+def _kept(val):
+    return {True: "True (cart kept)", False: "False (cart lost)"}.get(val, "None (not probed)")
+
+
 def show(rpt):
     """prompt -> experiment -> blind diagnosis (correct?) -> actions -> healed in Xs -> hardening -> LLM vs fallback."""
     exp, dxs = rpt.get("experiment_detail") or {}, rpt.get("diagnosis")
@@ -26,18 +30,29 @@ def show(rpt):
             print(f"   evidence: {itm}")
     for itm in rpt.get("applied_fixes", []):
         print(f"== Action attempt {itm['attempt']}: {itm['action']}({itm['target']}) ok={itm['ok']} {itm['detail']}")
-    if rpt.get("outcome") == "healed":
+    if rpt.get("outcome") == "healed" or (rpt.get("outcome") == "stopped_by_kill_switch" and rpt.get("healed")):
         sec = rpt.get("healed_in_s")
         print(f"== Healed in {sec}s" if sec is not None else "== Healed (stub: not timed)")
-    elif rpt.get("outcome") != "rejected":
+    elif rpt.get("outcome") not in ("rejected", "stopped_by_kill_switch"):
         print(f"== Not healed: {rpt.get('outcome')}" + (f" ({rpt['abort']})" if rpt.get("abort") else ""))
+    if rpt.get("hardening") == "not_applicable":
+        print(f"== Hardening: not applicable ({rpt.get('hardening_note')})")
     for itm in rpt.get("hardening_rounds", []):
-        print(f"== Hardening round {itm['round']}: {', '.join(itm['patches']) or 'no patch'} improved={itm['improved']}")
-    for cmp in rpt.get("comparisons", []):
-        for res in cmp["experiments"]:
-            print(f"   compare {res['id']} improved={res['improved']} error_rate={res['error_rate']} "
-                  f"recovery_s={res['recovery_s']} data_survived={res['data_survived']}")
-    agt = rpt.get("agents_detail") or {}
+        print(f"== Hardening round {itm['round']}: {', '.join(itm['patches']) or 'no patch'} improved={itm['improved']}"
+              + (f" ({itm['why']})" if itm.get("why") else ""))
+        if itm.get("score"):
+            print(f"   before -> after: error_rate={itm['error_rate']} recovery_s={itm['recovery_s']} "
+                  f"data_survived={itm['data_survived']} score={itm['score']['before']} -> {itm['score']['after']}")
+    if rpt.get("hardening") == "not_improved" and rpt.get("hardening_note"):
+        print(f"== Hardening: {rpt['hardening_note']}")
+    dsv = rpt.get("data_survived") or {}
+    if rpt.get("rounds"):
+        print(f"== Data survived (cart probe): before={_kept(dsv.get('before'))}"
+              + "".join(f", rerun {idx}={_kept(val)}" for idx, val in enumerate(dsv.get("rerun") or [], 1)))
+    if rpt.get("outcome") == "stopped_by_kill_switch":
+        print(f"== Stopped by kill switch during hardening round {rpt.get('rounds')}: {rpt.get('stopped')}; "
+              f"no further hardening fix applied")
+    agt =rpt.get("agents_detail") or {}
     print("== Agents: " + ", ".join(
         f"{nam}={'+'.join(met['source'] for met in mets)}"
         + "".join(f" ({why})" for why in dict.fromkeys(met["why"] for met in mets if met.get("why")))

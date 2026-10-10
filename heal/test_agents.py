@@ -245,7 +245,10 @@ def test_healthy_run_uses_three_llm_calls(fake):
     assert len(fkl.calls) == 3 and not fkl.errors
     assert rpt["agents"] == {"chaos_agent": ["llm"], "diagnosis_agent": ["llm"], "remediation_agent": ["llm"]}
     assert rpt["diagnosis_correct"] is True and rpt["experiment_detail"]["reason"] == CHAOS_OK["reason"]
-    assert rpt["hardening_rounds"] == [{"round": 1, "patches": ["redis_aof redis"], "improved": True}]
+    (rnd,) = rpt["hardening_rounds"]
+    assert (rnd["round"], rnd["patches"], rnd["improved"]) == (1, ["redis_aof redis"], True)
+    assert rnd["data_survived"] == [False, True] and rnd["why"] == ("data_survived false -> true; error_rate 0.62 -> 0.05; "
+                                                             "recovery 14s -> 4s")
 
 
 def test_retry_rediagnoses_nothing_and_remediates_twice(fake):

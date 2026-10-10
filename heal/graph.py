@@ -7,6 +7,11 @@ Heal (undo the injected fault now, at most MAX_ATTEMPTS):
 Harden (make the app survive the fault next time, at most MAX_ROUNDS):
   harden_agent -> apply_hardening -> rerun -> compare -> (done: improved, or round 2 used) guard_revert -> report
                                                      -> (not improved after round 1) revert_patch -> harden_agent
+  harden_agent -> (no patch to apply) guard_revert: no rerun; hardening = not_applicable (or not_improved in round 2).
+"improved" is the honest verdict(): a patch was applied, nothing regressed and there is a real gain.
+Kill switch while hardening (STOP file, checked before every hardening fix and after every compare): straight to
+  guard_revert -> report, outcome stopped_by_kill_switch; no further patch is applied.
+Live runs write the full report to data/heal_report.json (never in stub mode).
 
 remediation_agent / apply_fix may only use HEAL_CATALOG actions; hardening patches (patcher.make output) only
 appear in harden_agent / apply_hardening. revert_patch only runs between round 1 and round 2.
@@ -33,6 +38,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from heal import agents, ports
+from safety import guard
 from heal.agents import HEAL, HEAL_CATALOG, HEAL_DESC, WEB, check_heal, heal_plan  # noqa: F401 (re-exported)
 
 DAT = Path(__file__).resolve().parent.parent / "data"
@@ -42,6 +48,12 @@ SCENARIOS = ("retry", "healed", "unhealed", "rejected")
 HARDEN = ("round1", "round2", "never")
 LLM_S = 15  # live: max seconds per heal-agent LLM call (diagnosis, remediation)
 RESERVE_S = 25  # live: seconds of the heal deadline kept for apply_fix + verify
+ERR_SLACK = 0.05  # hardening: error_rate after may exceed before by at most this, else it regressed
+ERR_GAIN = 0.10  # hardening: error_rate must drop at least this much to count as a gain
+REC_GAIN, REC_GAIN_S = 0.30, 10  # hardening: recovery_s must drop >= 30% AND >= 10 s, else it is noise
+REPORT = DAT / "heal_report.json"  # live runs only
+NO_FIX = "no hardening fix available for this fault"
+KILL = "kill switch (STOP file)"
 
 
 class HealState(TypedDict, total=False):
@@ -70,6 +82,7 @@ class HealState(TypedDict, total=False):
     agents: dict
     diagnosis_score: dict
     hardening_log: list
+    stopped: str
 
 
 def log(nam, msg):
@@ -106,14 +119,58 @@ def route_verify(state):
     return "retry" if state.get("attempts", 0) < MAX_ATTEMPTS else "give_up"
 
 
+def verdict(cmp, patches):
+    """Honest hardening verdict -> {"improved", "why"}. Improved needs an applied patch, no regression (score after
+    >= before, error_rate after <= before + ERR_SLACK) and a real gain: data_survived false -> true, error_rate down
+    >= ERR_GAIN, or recovery_s down >= REC_GAIN and >= REC_GAIN_S seconds (smaller drops are noise)."""
+    if not patches:
+        return {"improved": False, "why": "no patch applied"}
+    scr = (cmp or {}).get("score") or {}
+    if scr.get("before") is not None and scr.get("after") is not None and scr["after"] < scr["before"]:
+        return {"improved": False, "why": f"regressed: score {scr['before']} -> {scr['after']}"}
+    gain = []
+    for exp in (cmp or {}).get("experiments", []):
+        (e_b, e_a), (r_b, r_a), (d_b, d_a) = (list(exp.get(key) or [None, None])
+                                              for key in ("error_rate", "recovery_s", "data_survived"))
+        if e_b is not None and e_a is not None and round(e_a - e_b, 6) > ERR_SLACK:
+            return {"improved": False, "why": f"regressed: {exp['id']} error_rate {e_b} -> {e_a}"}
+        if d_b is False and d_a is True:
+            gain.append("data_survived false -> true")
+        if e_b is not None and e_a is not None and round(e_b - e_a, 6) >= ERR_GAIN:
+            gain.append(f"error_rate {e_b} -> {e_a}")
+        if r_b and r_a is not None and r_b - r_a >= REC_GAIN_S and (r_b - r_a) / r_b >= REC_GAIN:
+            gain.append(f"recovery {r_b}s -> {r_a}s")
+    return {"improved": bool(gain), "why": "; ".join(gain) or "no gain beyond noise"}
+
+
 def improved(cmp):
+    """The honest verdict when compare() added one; else the per-experiment flag (comparison.json)."""
+    if "verdict" in (cmp or {}):
+        return cmp["verdict"]["improved"]
     return any(exp.get("improved") for exp in (cmp or {}).get("experiments", []))
 
 
+def stopped(state):
+    """True if the kill switch stopped hardening (recorded in the state, or the STOP file exists now)."""
+    return bool(state.get("stopped")) or guard.kill_switch()
+
+
+def route_harden(state):
+    """'apply' if harden_agent produced at least one patch and the kill switch is off, else 'skip' (no rerun)."""
+    if stopped(state):
+        return "skip"
+    return "apply" if ((state.get("hardening") or {}).get("patch") or {}).get("patches") else "skip"
+
+
+def route_stop(state):
+    """'stop' if apply_hardening was stopped by the kill switch, else 'ok'."""
+    return "stop" if state.get("stopped") else "ok"
+
+
 def route_compare(state):
-    """'round2' if the latest comparison did not improve and round < MAX_ROUNDS; else 'done' (improved, or both
-    rounds used). One label for both endings: LangGraph draws one edge per target, so a second label would vanish."""
-    if improved((state.get("comparisons") or [None])[-1]):
+    """'round2' if the latest comparison did not improve and round < MAX_ROUNDS; else 'done' (improved, both
+    rounds used, or the kill switch is on). One label for both endings: LangGraph draws one edge per target, so a second label would vanish."""
+    if stopped(state) or improved((state.get("comparisons") or [None])[-1]):
         return "done"
     return "round2" if state.get("round", 0) < MAX_ROUNDS else "done"
 
@@ -289,13 +346,21 @@ def harden_agent(state, config: RunnableConfig):
         pat = ports.make(state["diagnosis"]["findings"], pln, dep, rsl=[state["symptoms"]])
     else:
         pat = ports.make(state["fnd_after"], pln, dep, rsl=state["rsl_after"], exclude=state["round1_patches"])
-    log("harden_agent", f"round {rnd}: {', '.join(itm['fix'] + ' ' + itm['service'] for itm in pat['patches'])}")
-    return {"round": rnd, "hardening": {"round": rnd, "patch": pat}}
+    log("harden_agent", f"round {rnd}: {', '.join(itm['fix'] + ' ' + itm['service'] for itm in pat['patches'])}"
+                        if pat["patches"] else f"round {rnd}: {NO_FIX}, skipping the rerun")
+    out = {"round": rnd, "hardening": {"round": rnd, "patch": pat}}
+    if guard.kill_switch():
+        log("harden_agent", f"round {rnd}: {KILL}, no patch will be applied")
+        out["stopped"] = KILL
+    return out
 
 
 def apply_hardening(state, config: RunnableConfig):
-    """Apply the round's patches live: setup.patch.apply(pat)."""
+    """Apply the round's patches live: setup.patch.apply(pat), unless the kill switch is on (then nothing)."""
     hrd, rnd = state["hardening"], state["round"]
+    if guard.kill_switch():
+        log("apply_hardening", f"round {rnd}: {KILL}, no patch applied")
+        return {"stopped": KILL, "hardening": {**hrd, "applied": []}}
     ports.apply(hrd["patch"])
     ids = [itm["id"] for itm in hrd["patch"].get("patches", [])]
     log("apply_hardening", f"round {rnd}: applied {', '.join(ids) or 'nothing'}")
@@ -324,8 +389,13 @@ def rerun(state, config: RunnableConfig):
 def compare(state, config: RunnableConfig):
     """Always against the original before-results: compare(rsl, rsl_after, fnd, fnd_after)."""
     cmp = ports.compare([state["symptoms"]], state["rsl_after"], state["diagnosis"]["findings"], state["fnd_after"])
-    log("compare", f"round {state['round']}: improved={improved(cmp)}")
-    return {"comparisons": list(state.get("comparisons") or []) + [cmp]}
+    cmp = {**cmp, "verdict": verdict(cmp, ((state.get("hardening") or {}).get("patch") or {}).get("patches"))}
+    log("compare", f"round {state['round']}: improved={improved(cmp)} ({cmp['verdict']['why']})")
+    out = {"comparisons": list(state.get("comparisons") or []) + [cmp]}
+    if guard.kill_switch():
+        log("compare", f"{KILL}: no further hardening")
+        out["stopped"] = KILL
+    return out
 
 
 def revert_patch(state, config: RunnableConfig):
@@ -343,6 +413,8 @@ def report(state, config: RunnableConfig):
     exp, cmp, dxs = state.get("experiment") or {}, state.get("comparisons") or [], state.get("diagnosis") or {}
     if exp.get("rejection"):
         out = "rejected"
+    elif state.get("stopped"):
+        out = "stopped_by_kill_switch"
     elif (state.get("verify") or {}).get("healed"):
         out = "healed"
     elif state.get("abort"):
@@ -350,10 +422,14 @@ def report(state, config: RunnableConfig):
     else:
         out = "not_healed"
     hrd = next((f"improved_round{idx}" for idx, itm in enumerate(cmp, 1) if improved(itm)),
-               "not_improved" if cmp else None)
+               "not_improved" if cmp else ("not_applicable" if state.get("round") else None))
+    obs = (state.get("observed") or [state.get("symptoms") or {}])[0]
+    sym = agents.brief(obs, state.get("baseline") or {}) if obs.get("measured") else None
+    bef = state.get("symptoms") or {}
     rpt = {**(state.get("report") or {}), "prompt": state.get("prompt"), "outcome": out, "hardening": hrd,
            "experiment": exp.get("id"), "target": exp.get("target"), "attempts": state.get("attempts", 0),
            "rounds": state.get("round", 0), "comparisons": cmp, "abort": state.get("abort"),
+           "stopped": state.get("stopped"),
            "applied_fixes": state.get("applied_fixes") or [],
            "score": cmp[-1]["score"] if cmp else None, "stub": not _knob(config, "live", False),
            "experiment_detail": {key: exp.get(key) for key in ("target", "fault", "params", "reason", "hypothesis",
@@ -361,13 +437,37 @@ def report(state, config: RunnableConfig):
            "diagnosis": {key: dxs.get(key) for key in agents.DX_KEYS} if dxs.get("fault_guess") else None,
            "diagnosis_correct": (state.get("diagnosis_score") or {}).get("correct"),
            "diagnosis_score": state.get("diagnosis_score"),
-           "healed_in_s": (state.get("verify") or {}).get("recovery_s") if out == "healed" else None,
-           "hardening_rounds": [{**itm, "improved": improved(cmp[idx]) if idx < len(cmp) else None}
+           "healed_in_s": (state.get("verify") or {}).get("recovery_s"),
+           "healed": (state.get("verify") or {}).get("healed", False), "symptoms": sym,
+           "hardening_note": NO_FIX if hrd == "not_applicable" else (
+               f"round {state.get('round')}: {NO_FIX}" if hrd == "not_improved" and len(cmp) < state.get("round", 0)
+               else None),
+           "hardening_rounds": [hardening_round(itm, cmp[idx] if idx < len(cmp) else None)
                                 for idx, itm in enumerate(state.get("hardening_log") or [])],
+           "data_survived": {"before": bef.get("data_survived") if "data_survived" in bef else None,
+                             "rerun": [res.get("data_survived")[1] for itm in cmp for res in itm.get("experiments", [])
+                                       if res.get("data_survived")]},
            "agents": {nam: [met["source"] for met in mets] for nam, mets in (state.get("agents") or {}).items()},
            "agents_detail": state.get("agents") or {}}
     log("report", f"outcome={out} hardening={hrd} attempts={rpt['attempts']} rounds={rpt['rounds']}")
     return {"report": rpt}
+
+
+def hardening_round(itm, cmp):
+    """One hardening round for the report: patches, before/after metrics, score and the honest verdict."""
+    exp = ((cmp or {}).get("experiments") or [{}])[0]
+    return {**itm, "improved": improved(cmp) if cmp else None, "why": ((cmp or {}).get("verdict") or {}).get("why"),
+            "score": (cmp or {}).get("score"),
+            **{key: exp.get(key) for key in ("error_rate", "p95_ms", "recovery_s", "data_survived")}}
+
+
+def save_report(rpt, pth, out=None):
+    """Write the full report plus the graph path to data/heal_report.json (live runs only)."""
+    out = out or REPORT
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({**rpt, "path": pth}, indent=2, default=str), encoding="utf-8")
+    log("report", f"wrote {out}")
+    return out
 
 
 NODES = {fnc.__name__: fnc for fnc in (
@@ -395,7 +495,9 @@ def build(nodes=None):
         grf.add_edge(src, dst)
     grf.add_conditional_edges("verify", route_verify,
                               {"healed": "harden_agent", "retry": "observe", "give_up": "guard_revert"})
-    for src, dst in (("harden_agent", "apply_hardening"), ("apply_hardening", "rerun"), ("rerun", "compare"),
+    grf.add_conditional_edges("harden_agent", route_harden, {"apply": "apply_hardening", "skip": "guard_revert"})
+    grf.add_conditional_edges("apply_hardening", route_stop, {"stop": "guard_revert", "ok": "rerun"})
+    for src, dst in (("rerun", "compare"),
                      ("revert_patch", "harden_agent"), ("guard_revert", "report")):
         grf.add_edge(src, dst)
     grf.add_conditional_edges("compare", route_compare,
@@ -407,7 +509,8 @@ def build(nodes=None):
 def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, baseline_s=30):
     """Run the graph once. Return (final_state, path) where path lists the nodes in the order they ran.
     live=True: real nodes from heal/live.py (nodes= still overrides them), real ports, baseline_s s baseline;
-    injected faults are reverted and traffic stopped when the run ends, however it ends."""
+    injected faults are reverted and traffic stopped when the run ends, however it ends; the report is written to
+    data/heal_report.json (live only)."""
     if scenario not in SCENARIOS:
         raise ValueError(f"scenario '{scenario}' not one of {SCENARIOS}")
     if harden not in HARDEN:
@@ -425,6 +528,8 @@ def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, basel
             for nam, val in upd.items():
                 pth.append(nam)
                 sta.update(val or {})
+        if live and sta.get("report"):
+            save_report(sta["report"], pth)
     finally:
         if lmd:
             lmd.close()
