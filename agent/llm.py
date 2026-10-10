@@ -2,17 +2,20 @@
 
 LLM_PROVIDER = anthropic | gemini | openai (default anthropic), LLM_API_KEY = key for that provider,
 LLM_MODEL optionally overrides the default model, CHAOS_NO_LLM=1 forces callers onto their fallbacks.
+Each ask_json call is capped at CAP seconds overall so a slow API cannot hang the demo.
 Each SDK is imported only when its provider is selected.
 """
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENVS = [ROOT / ".env", ROOT / "agent" / ".env"]
 MDL = {"anthropic": "claude-opus-5-5", "gemini": "gemini-2.5-pro", "openai": "gpt-4.1"}
 PKG = {"anthropic": "anthropic", "gemini": "google-genai", "openai": "openai"}
-TMO = 180.0
+CAP = 25.0
 
 
 def _env():
@@ -26,12 +29,12 @@ def _env():
                 os.environ.setdefault(key.strip(), val.strip().strip("'\""))
 
 
-def _anthropic(key, mdl, sys_prompt, usr_prompt, schema):
+def _anthropic(key, mdl, sys_prompt, usr_prompt, schema, tmo):
     import anthropic
     cfg = {"effort": "medium"}
     if schema:
         cfg["format"] = {"type": "json_schema", "schema": schema}
-    cli = anthropic.Anthropic(api_key=key, timeout=TMO, max_retries=2)
+    cli = anthropic.Anthropic(api_key=key, timeout=tmo, max_retries=1)
     rsp = cli.beta.messages.create(
         model=mdl, max_tokens=16000, system=sys_prompt,
         messages=[{"role": "user", "content": usr_prompt}],
@@ -44,9 +47,9 @@ def _anthropic(key, mdl, sys_prompt, usr_prompt, schema):
     return "".join(blk.text for blk in rsp.content if blk.type == "text")
 
 
-def _openai(key, mdl, sys_prompt, usr_prompt, schema):
+def _openai(key, mdl, sys_prompt, usr_prompt, schema, tmo):
     from openai import OpenAI
-    cli = OpenAI(api_key=key, timeout=TMO, max_retries=2)
+    cli = OpenAI(api_key=key, timeout=tmo, max_retries=1)
     rsp = cli.chat.completions.create(
         model=mdl,
         messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": usr_prompt}],
@@ -58,16 +61,36 @@ def _openai(key, mdl, sys_prompt, usr_prompt, schema):
     return cho.message.content or ""
 
 
-def _gemini(key, mdl, sys_prompt, usr_prompt, schema):
+def _gemini(key, mdl, sys_prompt, usr_prompt, schema, tmo):
     from google import genai
-    cli = genai.Client(api_key=key)
-    rsp = cli.models.generate_content(
-        model=mdl, contents=usr_prompt,
-        config={"system_instruction": sys_prompt, "response_mime_type": "application/json"},
-    )
+    cfg = {"system_instruction": sys_prompt, "response_mime_type": "application/json"}
+    if mdl.startswith("gemini-3"):
+        cfg["thinking_config"] = {"thinking_level": "low"}  # default is high: ~2x slower, blows the time cap
+    cli = genai.Client(api_key=key, http_options={"timeout": int(tmo * 1000)})
+    rsp = cli.models.generate_content(model=mdl, contents=usr_prompt, config=cfg)
     if not rsp.text:
         raise RuntimeError("gemini returned no text (blocked or empty)")
     return rsp.text
+
+
+def _bounded(fnc, tmo, *arg):
+    """Run fnc(*arg, tmo) in a daemon thread; raise TimeoutError if it is still running after tmo seconds."""
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = fnc(*arg, tmo)
+        except BaseException as exc:
+            box["err"] = exc
+
+    thr = threading.Thread(target=run, daemon=True)
+    thr.start()
+    thr.join(tmo)
+    if thr.is_alive():
+        raise TimeoutError(f"LLM call exceeded the {CAP:g}s cap")
+    if "err" in box:
+        raise box["err"]
+    return box["ok"]
 
 
 CALL = {"anthropic": _anthropic, "gemini": _gemini, "openai": _openai}
@@ -100,7 +123,7 @@ def ask_json(sys_prompt, usr_prompt, tries=3, schema=None, check=None):
 
     schema: JSON Schema (object root); enforced by anthropic structured outputs, appended to the prompt otherwise.
     check:  fn(obj) -> cleaned obj; raising ValueError retries with the error fed back to the model.
-    Config, import, API and refusal errors are raised immediately so callers can fall back.
+    Config, import, API, refusal and timeout (CAP seconds across all tries) errors are raised so callers can fall back.
     """
     pvd, key, mdl = config()
     try:
@@ -109,9 +132,12 @@ def ask_json(sys_prompt, usr_prompt, tries=3, schema=None, check=None):
         raise RuntimeError(f"LLM_PROVIDER={pvd} needs `pip install {PKG[pvd]}` ({err})") from err
     if schema and pvd != "anthropic":
         sys_prompt = f"{sys_prompt}\n\nReply with a single JSON object matching this JSON Schema:\n{json.dumps(schema)}"
-    msg, err = usr_prompt, None
+    msg, err, end = usr_prompt, None, time.monotonic() + CAP
     for _ in range(tries):
-        txt = CALL[pvd](key, mdl, sys_prompt, msg, schema)
+        rem = end - time.monotonic()
+        if rem < 1:
+            raise TimeoutError(f"LLM gave no valid JSON within the {CAP:g}s cap: {err}")
+        txt = _bounded(CALL[pvd], rem, key, mdl, sys_prompt, msg, schema)
         try:
             obj = json.loads(_strip(txt))
             return check(obj) if check else obj

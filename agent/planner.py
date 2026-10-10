@@ -106,7 +106,7 @@ def validate(raw, dep, bas, top=3):
         itm = {"id": f"e{idx}", "target": tgt, "fault": fal, "params": prm,
                "risk": exp.get("risk") if exp.get("risk") in RSK else "medium", "rank": idx,
                "reason": exp["reason"].strip(), "hypothesis": exp["hypothesis"].strip()}
-        rej = guard.approve(itm, dep)
+        rej = guard.approve(itm, dep, mock=True)
         if rej:
             raise ValueError(f"{tag}: rejected by safety guard: {rej}")
         pln.append(itm)
@@ -129,7 +129,7 @@ def plan(dep, bas, top=3):
                            check=lambda raw: validate(raw, dep, bas, top))
         print(f"[planner] LLM plan with {len(pln)} experiments")
     except Exception as err:
-        print(f"[planner] LLM plan unavailable ({err}); using deterministic fallback")
+        print(f"[planner] LLM plan unavailable ({str(err)[:160]}); using deterministic fallback")
         pln = fallback(dep, top)
     assert all(exp["fault"] in FAULTS for exp in pln)
     return pln
