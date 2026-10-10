@@ -21,6 +21,10 @@ Live-only ports (raise outside live mode):
   verify       -> guard.ready on 1 s samples until steady (runner.REC_OK in a row) + recovery timing
 states       -> {service: container status} of project robot-shop (console status lines during the hold; stub: fake)
 heal_check works in both modes: the live heal guard (deadline, kill switch, collateral; no error-rate/p95 abort).
+ready        -> guard.ready on one 1 s sample (stub: always steady); heal.campaign waits on it between cycles.
+Campaign (heal.campaign, campaign(k) .. campaign(None)): hardening patches still applied at the end of a cycle are
+kept (keep()) for the later cycles: make() excludes them and prefixes new patch ids with "c<k>-" (setup.patch refuses
+a duplicate id or fix), and revert_patch() re-applies them after setup.patch.revert() (which undoes every patch).
 """
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +42,7 @@ LOG_N, LOG_W = 15, 200  # log lines per unhealthy service, characters per line
 MODE = {"live": False}
 _faults = []  # revert functions registered by inject(), newest last
 _last = {"pat": None}  # last patch applied live, for compare's patch_ids
+_camp = {"cycle": None, "kept": [], "applied": []}  # heal.campaign: patches kept from earlier cycles / applied in this one
 
 
 def use_live(on=True):
@@ -56,6 +61,33 @@ def _need_live(nam):
 
 def log(nam, msg):
     print(f"[heal.ports] {nam}: {msg}" + ("" if MODE["live"] else " (stub)"))
+
+
+def campaign(cycle):
+    """heal.campaign: cycle `cycle` starts (its applied patches are tracked); None ends the campaign."""
+    if cycle is None:
+        _camp.update(cycle=None, kept=[], applied=[])
+    else:
+        _camp.update(cycle=cycle, applied=[])
+
+
+def keep():
+    """End of a campaign cycle: the patches it left applied stay applied for later cycles. -> those patches"""
+    new, _camp["applied"] = _camp["applied"], []
+    _camp["kept"] = _camp["kept"] + new
+    return list(new)
+
+
+def kept():
+    """Patches kept applied from earlier campaign cycles."""
+    return list(_camp["kept"])
+
+
+def _tag(pat):
+    """Campaign: unique patch ids across cycles (c<k>-p1, ...)."""
+    if not _camp["cycle"]:
+        return pat
+    return {**pat, "patches": [{**itm, "id": f"c{_camp['cycle']}-{itm['id']}"} for itm in pat.get("patches") or []]}
 
 
 def review(dep):
@@ -87,9 +119,11 @@ def heal_fix(action, target):
 def make(fnd, pln, dep, rsl=None, exclude=None):
     """agent.patcher.make(fnd, pln, dep, rsl=rsl, exclude=exclude) -> patch.json {"patches", "code_suggestions"}.
     rsl = results the findings came from; exclude = patch dicts already tried (round 1), never proposed again."""
+    if _camp["cycle"]:
+        exclude = list(exclude or ()) + _camp["kept"]
     if MODE["live"]:
         from agent import patcher
-        return patcher.make(fnd, pln, dep, rsl=rsl, exclude=() if exclude is None else exclude, save=False)
+        return _tag(patcher.make(fnd, pln, dep, rsl=rsl, exclude=() if exclude is None else exclude, save=False))
     pex = {exp["id"]: exp for exp in pln}
     don = {(itm["fix"], itm["service"]) for itm in exclude or []}
     pts = []
@@ -101,7 +135,7 @@ def make(fnd, pln, dep, rsl=None, exclude=None):
                         "fix": fix, "reason": f"STUB: {itm['weakness']}", "expected": f"{tgt} survives the fault"})
     log("make", f"{len(pts)} patches from {len(fnd.get('findings', []))} findings, {len(rsl or [])} results, "
                 f"{len(don)} excluded")
-    return {"patches": pts, "code_suggestions": [], "stub": True}
+    return _tag({"patches": pts, "code_suggestions": [], "stub": True})
 
 
 def apply(pat):
@@ -114,19 +148,44 @@ def apply(pat):
         from setup import patch
         patch.apply(pch)
         _last["pat"] = pch
+        _applied(pch["patches"])
         log("apply", ", ".join(itm["fix"] + " " + itm["service"] for itm in pch["patches"]))
         return
+    _applied(pat.get("patches") or [])
     log("apply", f"{', '.join(itm['fix'] + ' ' + itm['service'] for itm in pat.get('patches', [])) or 'nothing'}")
+
+
+def _applied(pts):
+    if _camp["cycle"]:
+        _camp["applied"] = _camp["applied"] + [dict(itm) for itm in pts]
 
 
 def revert_patch():
     """setup.patch.revert() -> None. Undoes the applied patches; only used between hardening round 1 and 2."""
+    _camp["applied"] = []
     if MODE["live"]:
         from setup import patch
         patch.revert()
         _last["pat"] = None
+        _reapply(patch)
         return
-    log("revert_patch", "round-1 patches undone")
+    log("revert_patch", "round-1 patches undone" + (f", kept {', '.join(itm['id'] for itm in _camp['kept'])}"
+                                                   if _camp["kept"] else ""))
+
+
+def _reapply(patch):
+    """Campaign: setup.patch.revert() undid the earlier cycles' patches too; apply them again one by one (a patch
+    that cannot be re-applied is dropped from the kept list and logged)."""
+    oks = []
+    for itm in _camp["kept"]:
+        try:
+            patch.apply({"patches": [itm], "code_suggestions": []})
+            oks.append(itm)
+        except Exception as err:
+            log("revert_patch", f"could not re-apply kept patch {itm['id']} ({itm['fix']} {itm['service']}): {err}")
+    if oks:
+        log("revert_patch", f"re-applied kept patches {', '.join(itm['id'] for itm in oks)}")
+    _camp["kept"] = oks
 
 
 def compare(rsl_before, rsl_after, fnd_before, fnd_after):
@@ -268,6 +327,14 @@ def observe(bas):
             "unhealthy": bad, "containers": {svc: con.status for svc, con in sorted(cons.items())}, "cpu_pct": cpu,
             "netem": sorted(svc for svc, val in net.items() if val),
             "logs": logs, "observations": obs}
+
+
+def ready(bas):
+    """guard.ready on one 1 s sample -> None when steady, else the reason. Stub: always steady."""
+    if not MODE["live"]:
+        return None
+    from monitor import baseline
+    return guard.ready(baseline.sample(1.0), bas)
 
 
 def heal_check(smp, bas, tgt, until):
