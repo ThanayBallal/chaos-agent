@@ -285,7 +285,7 @@ def review(dep):
     hit = _cached(sig)
     if hit:
         print(f"[code-review] reusing cached LLM review of {hit['files_read']} files ({len(hit['risks'])} risks)")
-        return hit
+        return _with_state(hit, dep, src)
     rev = {"hash": sig, "files_read": len(src), "services": sorted(pack)}
     usr = (f"Dependency map edges: {json.dumps(dep['edges'])}\n\nSource excerpts per service:\n\n"
            + "\n\n".join(f"### {nam}\n" + "\n".join(lns) for nam, lns in pack.items())
@@ -304,7 +304,25 @@ def review(dep):
         OUT.write_text(json.dumps(rev, indent=2))
     except OSError:
         pass
-    return rev
+    return _with_state(rev, dep, src)
+
+
+def _with_state(rev, dep, src):
+    """Add the static scan's state-loss risks (e.g. setex into a redis with no volume) that the review missed.
+    They cite real file:lines, and a missed data-loss weakness would hide the most damaging experiment."""
+    if rev.get("source") == "static":
+        return rev
+    see = {(rsk["file"], rsk["line"]) for rsk in rev.get("risks", [])}
+    add = [rsk for rsk in static_scan(dep, src) if state_loss(rsk) and (rsk["file"], rsk["line"]) not in see]
+    if add:
+        print(f"[code-review] + {len(add)} state-loss weakness(es) from the static scan: "
+              + ", ".join(f"{rsk['file']}:{rsk['line']}" for rsk in add))
+    return {**rev, "risks": rev.get("risks", []) + add}
+
+
+def latency_ok():
+    """Latency is only auto-planned when CHAOS_ALLOW_LATENCY=1."""
+    return os.environ.get("CHAOS_ALLOW_LATENCY") == "1"
 
 
 STATE = re.compile(r"data[- ]loss|lost data|\bstate\b|persisten|no volume|only copy", re.I)
@@ -322,6 +340,8 @@ def to_plan(rev, dep, bas, cen, top=3):
     for rsk in rev.get("risks", []):
         if hea.get(rsk["dependency"], "healthy") != "healthy":
             continue
+        if rsk["fault"] == "latency" and not latency_ok():
+            rsk = dict(rsk, fault="pause", params=_params("pause"))
         if state_loss(rsk):  # data/state loss only shows when the store is killed and restarted
             sta.add(rsk["dependency"])
             if rsk["fault"] != "kill":

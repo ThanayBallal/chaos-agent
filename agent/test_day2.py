@@ -67,7 +67,7 @@ class Isolated(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         tmp = Path(self.tmp.name)
-        self.pat = [mock.patch.dict(os.environ, {"CHAOS_NO_LLM": "1", "CHAOS_NO_CODE": "1"}),
+        self.pat = [mock.patch.dict(os.environ, {"CHAOS_NO_LLM": "1", "CHAOS_NO_CODE": "1", "CHAOS_ALLOW_LATENCY": ""}),
                     mock.patch.object(patcher, "OUT", tmp / "patch.json"),
                     mock.patch.object(code_review, "OUT", tmp / "missing_review.json"),
                     mock.patch.dict(code_review.LAST, clear=True)]
@@ -149,9 +149,8 @@ class Patcher(Isolated):
         with mock.patch.object(patcher.llm, "ask_json", fake):
             pch = self.make(fnd, [exp("e1", "redis", "kill")])
         got = {(itm["fix"], itm["service"]): itm for itm in pch["patches"]}
-        self.assertEqual(set(got), {("redis_aof", "redis"), ("restart_policy", "redis")})  # only rule-eligible ones
+        self.assertEqual(set(got), {("redis_aof", "redis")})  # rule-eligible and one per service
         self.assertEqual(got[("redis_aof", "redis")]["reason"], "LLM reason")
-        self.assertNotEqual(got[("restart_policy", "redis")]["reason"], "r")  # filled from the template
         self.assertEqual([(itm["file"], itm["line"], itm["suggestion"]) for itm in pch["code_suggestions"]],
                          [("catalogue/server.js", 173, "LLM: reset mongoConnected on close")])
 
@@ -171,6 +170,28 @@ class Patcher(Isolated):
         fnd = [dict(finding(1, "e1", "redis"), evidence=evd("recovery 4s"))]
         rsl = [result("e1", "redis", "kill", data_survived=True, recovery_s=4)]
         self.assertEqual(patcher.make({"findings": fnd}, [exp("e1", "redis", "kill")], DEP, rsl)["patches"], [])
+
+    def test_one_patch_per_service_and_next_round_picks_the_next_fix(self):
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("no recovery measured", True))]
+        pln = [exp("e1", "redis", "kill")]
+        rnd = lambda exc=(): [(itm["fix"], itm["service"]) for itm in
+                              patcher.make({"findings": fnd}, pln, DEP, exclude=exc)["patches"]]
+        self.assertEqual(rnd(), [("redis_aof", "redis")])
+        self.assertEqual(rnd(["redis_aof"]), [("restart_policy", "redis")])
+        self.assertEqual(rnd(["redis:redis_aof"]), [("restart_policy", "redis")])
+        first = patcher.make({"findings": fnd}, pln, DEP)["patches"]
+        self.assertEqual(rnd(first), [("restart_policy", "redis")])  # earlier patch dicts work too
+        self.assertEqual(rnd(["redis_aof", "restart_policy"]), [])
+        self.assertEqual(rnd(["mongodb:redis_aof"]), [("redis_aof", "redis")])
+
+    def test_one_patch_per_service_across_experiments(self):
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("recovery 30s", True)),
+               dict(finding(2, "e2", "redis"), evidence=evd("no recovery measured")),
+               dict(finding(3, "e3", "mongodb"), evidence=evd("no recovery measured"))]
+        pln = [exp("e1", "redis", "kill"), exp("e2", "redis", "kill"), exp("e3", "mongodb", "kill")]
+        pch = patcher.make({"findings": fnd}, pln, DEP)
+        self.assertEqual([(itm["id"], itm["fix"], itm["service"]) for itm in pch["patches"]],
+                         [("p1", "redis_aof", "redis"), ("p2", "restart_policy", "mongodb")])
 
     def test_every_patch_uses_the_fix_allowlist_and_depmap_services(self):
         code_review.LAST.update(e1=[RISK_STATE], e2=[RISK_FLAG])
@@ -220,6 +241,39 @@ class Planner(Isolated):
         knd = {svc["name"]: svc["kind"] for svc in dep["services"]}
         got = {exp["fault"]: knd[exp["target"]] for exp in out[1:]}
         self.assertEqual(got, {"pause": "db", "cpu_stress": "app"})
+
+    def test_data_loss_kill_ranks_first(self):
+        pln = [exp("e1", "mongodb", "pause"), exp("e2", "catalogue", "cpu_stress"), exp("e3", "redis", "kill")]
+        code_review.LAST["e3"] = [RISK_STATE]
+        out = planner.diversify(pln, DEP, BAS, 3)
+        self.assertEqual([(exp["target"], exp["fault"]) for exp in out],
+                         [("redis", "kill"), ("mongodb", "pause"), ("catalogue", "cpu_stress")])
+        self.assertEqual(code_review.risks_for("e1"), [RISK_STATE])
+
+    def test_no_latency_unless_allowed(self):
+        self.assertNotIn("latency", planner.faults())
+        pln = planner.no_latency([exp("e1", "mongodb", "latency")])
+        self.assertEqual((pln[0]["fault"], pln[0]["params"]), ("pause", planner.PRM["pause"]))
+        bad = {"experiments": [{"target": "mongodb", "fault": "latency", "params": {"duration_s": 30, "delay_ms": 500},
+                                "risk": "high", "rank": 1, "reason": "r", "hypothesis": "h"}]}
+        with self.assertRaises(ValueError):
+            planner.validate(bad, DEP, BAS)
+        lat = dict(RISK_TMO, dependency="mongodb", fault="latency", weakness="slow queries", fix="add timeouts")
+        pln = code_review.to_plan({"risks": [lat]}, DEP, BAS, planner.centrality(DEP), 3)
+        self.assertEqual(pln[0]["fault"], "pause")
+        web = dict(DEP, services=[{"name": "web", "kind": "proxy", "depends_on": []}], edges=[])
+        self.assertEqual(planner.fallback(web, 1)[0]["fault"], "cpu_stress")
+        with mock.patch.dict(os.environ, {"CHAOS_ALLOW_LATENCY": "1"}):
+            self.assertIn("latency", planner.faults())
+            self.assertEqual(planner.no_latency([exp("e1", "mongodb", "latency")])[0]["fault"], "latency")
+            self.assertEqual(planner.validate(bad, DEP, BAS)[0]["fault"], "latency")
+
+    def test_review_adds_missed_state_loss_from_static_scan(self):
+        rev = {"source": "llm", "risks": [dict(RISK_TMO)]}
+        with mock.patch.object(code_review, "static_scan", lambda dep, src: [RISK_STATE, RISK_FLAG]):
+            out = code_review._with_state(rev, DEP, {})
+        self.assertEqual(out["risks"], [RISK_TMO, RISK_STATE])  # only the state-loss one is added
+        self.assertEqual(rev["risks"], [RISK_TMO])
 
     def test_latency_moves_after_core_faults_unless_top(self):
         pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "latency"), exp("e3", "rabbitmq", "pause")]

@@ -9,6 +9,8 @@ Rules decide which patches exist:
 - redis data/state loss (data_survived false, a "data loss" finding, or a state-loss code weakness on redis) -> redis_aof on redis
 - a killed dependency with slow (> SLOW_S) or no recovery -> restart_policy on that service
 data_survived and recovery_s come from the results (rsl) when given, else from the findings' evidence text.
+At most ONE patch per service per round, priority in FIXES order (redis_aof over restart_policy). exclude lists
+fixes already tried in earlier rounds, so the next round picks the next fix ("at most 2 fix attempts" = 2 rounds).
 Everything else (stale health flags, missing timeouts, publish-before-commit, ...) -> code_suggestions citing a
 code-review file:line. The LLM, when available, only words reason/expected/suggestions; anything that is not an
 eligible patch (fix not in FIXES, service not in depmap, rule not met) or not a cited file:line is dropped.
@@ -22,7 +24,7 @@ from agent import code_review, llm
 
 ROT = Path(__file__).resolve().parent.parent
 OUT = ROT / "data" / "patch.json"
-FIXES = ("redis_aof", "restart_policy")
+FIXES = ("redis_aof", "restart_policy")  # also the priority order
 SLOW_S = 10  # recovery longer than this after a kill counts as slow
 LOSS = re.compile(r"data[- ]loss|lost data|data (was|is|were) lost|data_survived false", re.I)
 STATE = re.compile(r"state|persisten|no volume|only copy", re.I)
@@ -106,6 +108,27 @@ def eligible(fnd, pln, dep, rsl=None):
     return out, cit
 
 
+def _tried(key, exclude):
+    """exclude entries: a fix name ("redis_aof"), "service:fix", or a patch dict from an earlier round."""
+    fix, svc, _ = key
+    for itm in exclude or ():
+        if isinstance(itm, dict):
+            itm = f"{itm.get('service')}:{itm.get('fix')}"
+        if itm in (fix, f"{svc}:{fix}"):
+            return True
+    return False
+
+
+def pick(elg, exclude=()):
+    """One patch per service: the highest-priority fix not tried yet (first experiment wins on ties)."""
+    out, see = {}, set()
+    for key in sorted(elg, key=lambda key: FIXES.index(key[0])):
+        if key[1] not in see and not _tried(key, exclude):
+            see.add(key[1])
+            out[key] = elg[key]
+    return out
+
+
 def suggestions(cit, pat):
     """Template code suggestions: every cited weakness except state loss already covered by a redis_aof patch."""
     aof = any(fix == "redis_aof" for fix, _, _ in pat)
@@ -163,10 +186,12 @@ def prompt(fnd, pln, elg):
     return f"Return {{\"patches\": [...], \"code_suggestions\": [...]}}.\n\n{json.dumps(dat, indent=1)}"
 
 
-def make(fnd, pln, dep, rsl=None, save=True):
+def make(fnd, pln, dep, rsl=None, exclude=(), save=True):
     """Return patch.json for these findings and write it to data/patch.json.
-    rsl: the result.json list behind fnd; when given, data_survived and recovery_s are read from it directly."""
-    elg, cit = eligible(fnd, pln, dep, rsl)
+    rsl: the result.json list behind fnd; when given, data_survived and recovery_s are read from it directly.
+    exclude: fixes already tried (fix name, "service:fix" or earlier patch dicts); at most one patch per service."""
+    alg, cit = eligible(fnd, pln, dep, rsl)
+    elg = pick(alg, exclude)
     pat, sug, src = {}, [], "template"
     if fnd.get("findings") and (elg or cit):
         try:
@@ -177,7 +202,7 @@ def make(fnd, pln, dep, rsl=None, save=True):
             print(f"[patcher] LLM wording unavailable ({str(err)[:120]}); using templates")
     pts = [pat.get(key, tpl) for key, tpl in elg.items()]  # every eligible patch, LLM wording when valid
     see = {(itm["file"], itm["line"]) for itm in sug}
-    sug += [itm for itm in suggestions(cit, elg) if (itm["file"], itm["line"]) not in see]
+    sug += [itm for itm in suggestions(cit, alg) if (itm["file"], itm["line"]) not in see]
     pch = {"patches": [{"id": f"p{idx}", **itm} for idx, itm in enumerate(pts, 1)], "code_suggestions": sug}
     print(f"[patcher] {len(pch['patches'])} live patches ({', '.join(itm['fix'] + ' ' + itm['service'] for itm in pts) or 'none'}), "
           f"{len(sug)} code suggestions ({src})")
