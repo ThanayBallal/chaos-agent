@@ -55,5 +55,21 @@ Rule for every AI tool: **only edit files in your own folder, and follow this fi
 ## Safety limits (owner: P5)
 - Only containers in compose project `robot-shop` may be touched.
 - Max fault duration 60 s. One experiment at a time.
-- Abort if error_rate > 0.5 for 10 s, or p95 > 5000 ms, or a non-target service goes unhealthy.
+- Abort if error_rate > 0.5 for 10 s, or p95 > 5000 ms, or a service **outside the target's blast radius** goes unhealthy.
+  Blast radius = the target + every service that transitively depends on it (from depmap `depends_on` and `edges`).
 - Kill switch: create file `STOP` in repo root (or Ctrl+C) → all faults reverted immediately.
+  A stale `STOP` is removed when `guard.install()` runs at startup.
+- Active faults are mirrored to `data/active_faults.json`; `python -m safety.recover` restores all robot-shop containers.
+
+### Guard API (`safety/guard.py`, used by the runner)
+- `approve(exp, dep, mock=False)` → `None` or rejection reason. Checks allowlist, target in depmap, params, duration ≤ 60 s,
+  and (unless `mock`) that a Docker container with label `com.docker.compose.project=robot-shop` exists for the target.
+  On success it remembers the target's blast radius for `check()`.
+- `reset()` — clear breach timers. Call before each experiment.
+- `ready(sample, bas)` → `None` or reason if not at steady state (any service unhealthy, or error_rate > 3× baseline).
+  Call before injecting.
+- `register(fnc, info=None)` — register a zero-arg revert function right after injecting; `info` is any JSON-able description (e.g. the exp).
+- `unregister(fnc)` — call after a revert has run successfully.
+- `check(sample, bas, tgt, allowed=None)` → `None` or abort reason. `sample` = `{"t", "error_rate", "p95_ms", "health": {svc: state}}`.
+  `allowed` = services that may go unhealthy; defaults to the blast radius from the last `approve()` of `tgt`, else just `{tgt}`.
+- `kill_switch()` → `True` if `STOP` exists. `revert_all()` — run every registered revert (also on Ctrl+C and at exit).
