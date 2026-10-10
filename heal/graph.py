@@ -11,11 +11,14 @@ Harden (make the app survive the fault next time, at most MAX_ROUNDS):
 remediation_agent / apply_fix may only use HEAL_CATALOG actions; hardening patches (patcher.make output) only
 appear in harden_agent / apply_hardening. revert_patch only runs between round 1 and round 2.
 guard_revert undoes injected faults only, never patches.
+Abort (live only: not steady, injection failed, kill switch, collateral outside the blast radius, 60 s heal deadline):
+  inject / observe -> (abort) guard_revert; verify -> (abort) give_up -> guard_revert.
 
-Every node is a STUB: it logs and returns plausible fake data marked "stub": True and never writes data/*.json.
-Nodes call team modules only through heal/ports.py, which has the exact target signatures.
+Two modes, one graph. STUB (default): the nodes below log and return plausible fake data marked "stub": True and never
+write data/*.json. LIVE (run(..., live=True)): heal/live.py replaces the measuring nodes with real ones on project
+robot-shop and heal/ports.py switches to the real modules. Nodes call team modules only through heal/ports.py.
 Stub knobs in config["configurable"]: scenario = retry (default) | healed | unhealed | rejected (heal outcome),
-harden = round1 (default) | round2 | never (which hardening round improves).
+harden = round1 (default) | round2 | never (which hardening round improves). Both are ignored in live mode.
 """
 import json
 from pathlib import Path
@@ -61,6 +64,9 @@ class HealState(TypedDict, total=False):
     rsl_after: list
     fnd_after: dict
     comparisons: list
+    abort: str
+    heal: dict
+    observed: list
 
 
 def log(nam, msg):
@@ -106,10 +112,18 @@ def route_approval(state):
     return "rejected" if (state.get("experiment") or {}).get("rejection") else "approved"
 
 
+def route_abort(state):
+    """'abort' if a live guard check stopped the heal (state["abort"] set), else 'ok'."""
+    return "abort" if state.get("abort") else "ok"
+
+
 def route_verify(state):
-    """'healed' if verify says so; else 'retry' while attempts < MAX_ATTEMPTS; else 'give_up'."""
+    """'healed' if verify says so; else 'give_up' on an abort; else 'retry' while attempts < MAX_ATTEMPTS;
+    else 'give_up'."""
     if (state.get("verify") or {}).get("healed"):
         return "healed"
+    if state.get("abort"):
+        return "give_up"
     return "retry" if state.get("attempts", 0) < MAX_ATTEMPTS else "give_up"
 
 
@@ -209,11 +223,14 @@ def apply_fix(state, config: RunnableConfig):
     """Run each heal action: heal_fix(action, target). Refuses anything outside HEAL_CATALOG. Counts the attempt."""
     act = check_heal((state.get("fix_plan") or {}).get("actions") or [])
     att = state.get("attempts", 0) + 1
-    for itm in act:
-        ports.heal_fix(itm["action"], itm["target"])
+    res = [ports.heal_fix(itm["action"], itm["target"]) or {} for itm in act]
     log("apply_fix", f"attempt {att}: {', '.join(itm['action'] for itm in act)}")
-    return {"applied_fixes": list(state.get("applied_fixes") or []) + [{**itm, "attempt": att} for itm in act],
-            "attempts": att}
+    return {"applied_fixes": list(state.get("applied_fixes") or []) + fix_rows(act, res, att), "attempts": att}
+
+
+def fix_rows(act, res, att):
+    """applied_fixes entries: the planned action, its attempt number, and what heal_fix reported."""
+    return [{**itm, "attempt": att, "ok": out.get("ok"), "detail": out.get("detail")} for itm, out in zip(act, res)]
 
 
 def verify(state, config: RunnableConfig):
@@ -290,20 +307,23 @@ def revert_patch(state, config: RunnableConfig):
 
 
 def report(state, config: RunnableConfig):
-    """STUB: summarise the run, with every hardening comparison."""
+    """Summarise the run, with every hardening comparison."""
     exp, cmp = state.get("experiment") or {}, state.get("comparisons") or []
     if exp.get("rejection"):
         out = "rejected"
     elif (state.get("verify") or {}).get("healed"):
         out = "healed"
+    elif state.get("abort"):
+        out = "aborted"
     else:
         out = "not_healed"
     hrd = next((f"improved_round{idx}" for idx, itm in enumerate(cmp, 1) if improved(itm)),
                "not_improved" if cmp else None)
     rpt = {**(state.get("report") or {}), "prompt": state.get("prompt"), "outcome": out, "hardening": hrd,
            "experiment": exp.get("id"), "target": exp.get("target"), "attempts": state.get("attempts", 0),
-           "rounds": state.get("round", 0), "comparisons": cmp,
-           "score": cmp[-1]["score"] if cmp else None, "stub": True}
+           "rounds": state.get("round", 0), "comparisons": cmp, "abort": state.get("abort"),
+           "applied_fixes": state.get("applied_fixes") or [],
+           "score": cmp[-1]["score"] if cmp else None, "stub": not _knob(config, "live", False)}
     log("report", f"outcome={out} hardening={hrd} attempts={rpt['attempts']} rounds={rpt['rounds']}")
     return {"report": rpt}
 
@@ -326,8 +346,10 @@ def build(nodes=None):
     grf.add_edge("understand", "chaos_agent")
     grf.add_edge("chaos_agent", "guard_approve")
     grf.add_conditional_edges("guard_approve", route_approval, {"rejected": "report", "approved": "inject"})
-    for src, dst in (("inject", "observe"), ("observe", "diagnosis_agent"), ("diagnosis_agent", "remediation_agent"),
-                     ("remediation_agent", "apply_fix"), ("apply_fix", "verify")):
+    grf.add_conditional_edges("inject", route_abort, {"abort": "guard_revert", "ok": "observe"})
+    grf.add_conditional_edges("observe", route_abort, {"abort": "guard_revert", "ok": "diagnosis_agent"})
+    for src, dst in (("diagnosis_agent", "remediation_agent"), ("remediation_agent", "apply_fix"),
+                     ("apply_fix", "verify")):
         grf.add_edge(src, dst)
     grf.add_conditional_edges("verify", route_verify,
                               {"healed": "harden_agent", "retry": "observe", "give_up": "guard_revert"})
@@ -340,16 +362,28 @@ def build(nodes=None):
     return grf.compile()
 
 
-def run(prompt, scenario="retry", nodes=None, harden="round1"):
-    """Run the graph once. Return (final_state, path) where path lists the nodes in the order they ran."""
+def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, baseline_s=30):
+    """Run the graph once. Return (final_state, path) where path lists the nodes in the order they ran.
+    live=True: real nodes from heal/live.py (nodes= still overrides them), real ports, baseline_s s baseline;
+    injected faults are reverted and traffic stopped when the run ends, however it ends."""
     if scenario not in SCENARIOS:
         raise ValueError(f"scenario '{scenario}' not one of {SCENARIOS}")
     if harden not in HARDEN:
         raise ValueError(f"harden '{harden}' not one of {HARDEN}")
     sta, pth = {"prompt": prompt, "attempts": 0}, []
-    cfg = {"configurable": {"scenario": scenario, "harden": harden}, "recursion_limit": 60}
-    for upd in build(nodes).stream(dict(sta), config=cfg, stream_mode="updates"):
-        for nam, val in upd.items():
-            pth.append(nam)
-            sta.update(val or {})
+    cfg = {"configurable": {"scenario": scenario, "harden": harden, "live": live, "baseline_s": baseline_s},
+           "recursion_limit": 60}
+    lmd = None
+    if live:
+        from heal import live as lmd
+        ports.use_live(True)
+        nodes = {**lmd.NODES, **(nodes or {})}
+    try:
+        for upd in build(nodes).stream(dict(sta), config=cfg, stream_mode="updates"):
+            for nam, val in upd.items():
+                pth.append(nam)
+                sta.update(val or {})
+    finally:
+        if lmd:
+            lmd.close()
     return sta, pth
