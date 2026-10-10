@@ -100,8 +100,8 @@ def ready(smp, bas):
 
 
 def reset():
+    """Clear breach timers only. The blast radius is owned by approve()."""
     _brc["since"] = None
-    _ctx.update(target=None, blast=None)
 
 
 def kill_switch():
