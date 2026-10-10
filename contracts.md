@@ -73,3 +73,32 @@ Rule for every AI tool: **only edit files in your own folder, and follow this fi
 - `check(sample, bas, tgt, allowed=None)` → `None` or abort reason. `sample` = `{"t", "error_rate", "p95_ms", "health": {svc: state}}`.
   `allowed` = services that may go unhealthy; defaults to the blast radius from the last `approve()` of `tgt`, else just `{tgt}`.
 - `kill_switch()` → `True` if `STOP` exists. `revert_all()` — run every registered revert (also on Ctrl+C and at exit).
+
+## Day 2 additions
+
+### result.json: new field (P3)
+"data_survived": true | false | null
+# A cart is created before the fault and read back after recovery. null means it was not probed.
+# Also add a matching measured observation line.
+
+### patch.json (owner: P4 -> used by P1, P5)
+{"patches": [{"id": "p1", "experiment": "e1", "service": "redis", "fix": "redis_aof",
+   "reason": "cart/server.js:379 carts stored only in redis, no persistence",
+   "expected": "carts survive a redis crash"}],
+ "code_suggestions": [{"file": "cart/server.js", "line": 399, "suggestion": "set redisConnected=false on error"}]}
+"fix" must be one of: redis_aof, restart_policy.
+Fixes are applied live and reverted live. Robot Shop files are never edited.
+
+### comparison.json (owner: P3 helper, called by P5)
+{"patch_ids": ["p1"], "score": {"before": 50, "after": 78},
+ "experiments": [{"id": "e1", "target": "redis", "fault": "kill", "improved": true,
+   "error_rate": [0.62, 0.05], "p95_ms": [2400, 300], "recovery_s": [14, 4], "data_survived": [false, true]}]}
+Each pair is [before, after].
+"improved" = data_survived went false->true, OR error_rate dropped >= 0.10, OR recovery_s dropped >= 30%.
+At most 2 fix attempts per run.
+
+### Interfaces
+- agent/patcher.py:   make(fnd, pln, dep) -> patch.json dict                        (P4)
+- setup/patch.py:     apply(pat) -> None ; revert() -> None                         (P1)
+- monitor/compare.py: compare(rsl_before, rsl_after, fnd_before, fnd_after) -> comparison.json dict  (P3)
+- graph.py:           LangGraph flow map -> plan -> run -> analyze -> patch -> apply -> rerun -> compare  (P5)
