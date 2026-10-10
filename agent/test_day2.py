@@ -57,13 +57,17 @@ def result(eid, tgt, fal, err=0.02, **kw):
             "p95_ms": 200, "recovery_s": 5, "aborted": False, "abort_reason": None, "observations": [], **kw}
 
 
+for _rsk in (RISK_STATE, RISK_FLAG, RISK_TMO):
+    _rsk.update(params=dict(planner.PRM[_rsk["fault"]]), hypothesis=f"{_rsk['service']} degrades")
+
+
 class Isolated(unittest.TestCase):
     """No LLM, no writes into data/, a clean code-review risk table."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         tmp = Path(self.tmp.name)
-        self.pat = [mock.patch.dict(os.environ, {"CHAOS_NO_LLM": "1", "CHAOS_NO_CODE": "1"}),
+        self.pat = [mock.patch.dict(os.environ, {"CHAOS_NO_LLM": "1", "CHAOS_NO_CODE": "1", "CHAOS_ALLOW_LATENCY": ""}),
                     mock.patch.object(patcher, "OUT", tmp / "patch.json"),
                     mock.patch.object(code_review, "OUT", tmp / "missing_review.json"),
                     mock.patch.dict(code_review.LAST, clear=True)]
@@ -76,82 +80,131 @@ class Isolated(unittest.TestCase):
         self.tmp.cleanup()
 
 
+RISK_PUB = {"service": "payment", "dependency": "rabbitmq", "file": "payment/payment.py", "line": 120,
+            "quote": "publisher.publish(order)", "fault": "kill",
+            "weakness": "the order is published before the cart delete that can still fail",
+            "fix": "publish only after the cart delete succeeds", "weight": 2}
+
+
+def evd(rec="recovery 14s", loss=False):
+    return f"error_rate 0.004 -> 0.62, p95 180 -> 2400ms, {rec}" + (", data_survived false" if loss else "")
+
+
 class Patcher(Isolated):
-    def test_redis_state_loss_gets_aof_volume_and_restart(self):
+    def make(self, fnd, pln):
+        return patcher.make({"findings": fnd}, pln, DEP)
+
+    def test_redis_state_loss_gives_redis_aof(self):
         code_review.LAST["e1"] = [RISK_STATE]
-        pch = patcher.make({"findings": [finding(1, "e1", "redis")]}, [exp("e1", "redis", "kill")], DEP)
-        red = pch["override"]["services"]["redis"]
-        self.assertEqual(red["restart"], "unless-stopped")
-        self.assertEqual(red["command"], ["redis-server", "--appendonly", "yes"])
-        self.assertEqual(red["volumes"], ["redis-data:/data"])
-        self.assertEqual(pch["override"]["volumes"], {"redis-data": {}})
-        self.assertEqual(pch["source"], "template")
-        self.assertIn({"finding": 1, "service": "cart", "file": "cart/server.js", "line": 379,
-                       "suggestion": RISK_STATE["fix"]}, pch["code_suggestions"])
+        pch = self.make([dict(finding(1, "e1", "redis"), evidence=evd("recovery 4s"))], [exp("e1", "redis", "kill")])
+        self.assertEqual([(itm["id"], itm["fix"], itm["service"], itm["experiment"]) for itm in pch["patches"]],
+                         [("p1", "redis_aof", "redis", "e1")])
+        self.assertTrue(pch["patches"][0]["reason"].startswith("cart/server.js:379"))
+        self.assertEqual(set(pch["patches"][0]), {"id", "experiment", "service", "fix", "reason", "expected"})
+        self.assertEqual(pch["code_suggestions"], [])  # the state-loss weakness is covered by the live patch
         self.assertEqual(json.loads(patcher.OUT.read_text()), pch)
 
-    def test_stale_health_flag_gets_restart_and_healthcheck(self):
-        code_review.LAST["e1"] = [RISK_FLAG]
-        pch = patcher.make({"findings": [finding(1, "e1", "mongodb")]}, [exp("e1", "mongodb", "kill")], DEP)
-        mgo = pch["override"]["services"]["mongodb"]
-        self.assertEqual(mgo["restart"], "unless-stopped")
-        self.assertEqual(mgo["healthcheck"]["test"][0], "CMD")
-        self.assertNotIn("command", mgo)
+    def test_data_survived_false_on_redis_gives_redis_aof_without_code_review(self):
+        fnd = [dict(finding(1, "e1", "redis", "Data loss: carts did not survive"), evidence=evd("recovery 4s", True))]
+        pch = self.make(fnd, [exp("e1", "redis", "kill")])
+        self.assertEqual([itm["fix"] for itm in pch["patches"]], ["redis_aof"])
 
-    def test_missing_timeout_is_only_a_code_suggestion(self):
-        code_review.LAST["e1"] = [RISK_TMO]
-        pch = patcher.make({"findings": [finding(1, "e1", "user")]}, [exp("e1", "user", "pause")], DEP)
-        self.assertEqual(pch["changes"], [])
-        self.assertEqual([(sug["file"], sug["line"]) for sug in pch["code_suggestions"]], [("payment/payment.py", 64)])
+    def test_killed_dependency_with_slow_or_no_recovery_gets_restart_policy(self):
+        pln = [exp("e1", "mongodb", "kill"), exp("e2", "rabbitmq", "kill"), exp("e3", "catalogue", "kill"),
+               exp("e4", "user", "pause")]
+        fnd = [dict(finding(1, "e1", "mongodb"), evidence=evd("recovery 22s")),
+               dict(finding(2, "e2", "rabbitmq"), evidence=evd("no recovery measured")),
+               dict(finding(3, "e3", "catalogue"), evidence=evd("recovery 4s")),
+               dict(finding(4, "e4", "user"), evidence=evd("no recovery measured"))]
+        pch = self.make(fnd, pln)
+        self.assertEqual([(itm["fix"], itm["service"]) for itm in pch["patches"]],
+                         [("restart_policy", "mongodb"), ("restart_policy", "rabbitmq")])
+        self.assertIn("22s", pch["patches"][0]["reason"])
 
-    def test_data_loss_finding_without_risks_still_persists(self):
-        fnd = {"findings": [finding(1, "e1", "redis", "Data loss: carts did not survive the kill")]}
-        pch = patcher.make(fnd, [exp("e1", "redis", "kill")], DEP)
-        self.assertIn("redis-data:/data", pch["override"]["services"]["redis"]["volumes"])
+    def test_code_weaknesses_become_code_suggestions(self):
+        code_review.LAST.update(e1=[RISK_FLAG], e2=[RISK_TMO], e3=[RISK_PUB])
+        pln = [exp("e1", "mongodb", "kill"), exp("e2", "user", "pause"), exp("e3", "rabbitmq", "kill")]
+        fnd = [dict(finding(idx, f"e{idx}", tgt), evidence=evd("recovery 4s"))
+               for idx, tgt in ((1, "mongodb"), (2, "user"), (3, "rabbitmq"))]
+        pch = self.make(fnd, pln)
+        self.assertEqual(pch["patches"], [])
+        self.assertEqual({(itm["file"], itm["line"]) for itm in pch["code_suggestions"]},
+                         {("catalogue/server.js", 173), ("payment/payment.py", 64), ("payment/payment.py", 120)})
+        for itm in pch["code_suggestions"]:
+            self.assertEqual(set(itm), {"file", "line", "suggestion"})
 
-    def test_templates_only_use_allowed_keys_and_known_services(self):
-        code_review.LAST.update(e1=[RISK_STATE], e2=[RISK_FLAG], e3=[RISK_TMO])
-        fnd = {"findings": [finding(1, "e1", "redis"), finding(2, "e2", "mongodb"), finding(3, "e3", "user")]}
-        pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "kill"), exp("e3", "user", "pause")]
-        nam = {svc["name"] for svc in DEP["services"]}
-        for chg in patcher.make(fnd, pln, DEP)["changes"]:
-            self.assertLessEqual(set(chg["set"]), set(patcher.ALLOWED))
-            self.assertIn(chg["service"], nam)
-            patcher.check_set(chg["set"])
-
-    def test_validate_rejects_unsafe_llm_output(self):
-        code_review.LAST["e1"] = [RISK_STATE]
-        fnd, pln = {"findings": [finding(1, "e1", "redis")]}, [exp("e1", "redis", "kill")]
-        ok = {"finding": 1, "service": "redis", "set": {"restart": "unless-stopped"}, "why": "w"}
-        bad = [dict(ok, set={"ports": ["6379:6379"]}),
-               dict(ok, service="nginx"),
-               dict(ok, set={"volumes": ["/var/lib/host:/data"]}),
-               dict(ok, set={"restart": "sometimes"}),
-               dict(ok, set={"environment": ["not an assignment"]}),
-               dict(ok, set={"healthcheck": {"test": ["redis-cli", "ping"]}}),
-               dict(ok, finding=9)]
-        for chg in bad:
-            with self.assertRaises(ValueError, msg=chg):
-                patcher.validate({"changes": [chg], "code_suggestions": []}, fnd, pln, DEP)
-        with self.assertRaises(ValueError):
-            patcher.validate({"changes": [ok], "code_suggestions": [
-                {"finding": 1, "service": "cart", "file": "cart/server.js", "line": 1, "suggestion": "s"}]},
-                fnd, pln, DEP)
-        chg, sug = patcher.validate({"changes": [ok], "code_suggestions": [
-            {"finding": 1, "service": "cart", "file": "cart/server.js", "line": 379, "suggestion": "s"}]},
-            fnd, pln, DEP)
-        self.assertEqual(chg[0]["experiment"], "e1")
-        self.assertEqual(sug[0]["line"], 379)
-
-    def test_llm_path_is_used_when_valid(self):
-        rep = {"changes": [{"finding": 1, "service": "redis", "why": "w",
-                            "set": {"restart": "unless-stopped", "volumes": ["redis-data:/data"]}}],
-               "code_suggestions": []}
+    def test_llm_wording_kept_and_invalid_items_dropped(self):
+        code_review.LAST["e1"] = [RISK_STATE, RISK_FLAG]
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("no recovery measured"))]
+        rep = {"patches": [
+            {"experiment": "e1", "service": "redis", "fix": "redis_aof", "reason": "LLM reason", "expected": "LLM exp"},
+            {"experiment": "e1", "service": "redis", "fix": "add_replica", "reason": "r", "expected": "e"},
+            {"experiment": "e1", "service": "nginx", "fix": "restart_policy", "reason": "r", "expected": "e"},
+            {"experiment": "e1", "service": "mongodb", "fix": "restart_policy", "reason": "r", "expected": "e"},
+            {"experiment": "e1", "service": "mongodb", "fix": "redis_aof", "reason": "r", "expected": "e"}],
+            "code_suggestions": [
+            {"file": "catalogue/server.js", "line": 173, "suggestion": "LLM: reset mongoConnected on close"},
+            {"file": "cart/server.js", "line": 1, "suggestion": "uncited line"}]}
         fake = lambda sp, up, schema=None, check=None, **kw: check(rep)
         with mock.patch.object(patcher.llm, "ask_json", fake):
-            pch = patcher.make({"findings": [finding(1, "e1", "redis")]}, [exp("e1", "redis", "kill")], DEP)
-        self.assertEqual(pch["source"], "llm")
-        self.assertEqual(pch["override"]["volumes"], {"redis-data": {}})
+            pch = self.make(fnd, [exp("e1", "redis", "kill")])
+        got = {(itm["fix"], itm["service"]): itm for itm in pch["patches"]}
+        self.assertEqual(set(got), {("redis_aof", "redis")})  # rule-eligible and one per service
+        self.assertEqual(got[("redis_aof", "redis")]["reason"], "LLM reason")
+        self.assertEqual([(itm["file"], itm["line"], itm["suggestion"]) for itm in pch["code_suggestions"]],
+                         [("catalogue/server.js", 173, "LLM: reset mongoConnected on close")])
+
+    def test_results_are_used_directly_when_given(self):
+        pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "kill")]
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("recovery 4s")),  # evidence says nothing about loss
+               dict(finding(2, "e2", "mongodb"), evidence=evd("recovery 4s"))]  # evidence says fast recovery
+        rsl = [result("e1", "redis", "kill", data_survived=False, recovery_s=4),
+               result("e2", "mongodb", "kill", data_survived=None, recovery_s=None)]
+        pch = patcher.make({"findings": fnd}, pln, DEP, rsl)
+        self.assertEqual([(itm["fix"], itm["service"]) for itm in pch["patches"]],
+                         [("redis_aof", "redis"), ("restart_policy", "mongodb")])
+        self.assertEqual(patcher.make({"findings": fnd}, pln, DEP)["patches"], [])  # evidence-only: nothing to fix
+
+    def test_measured_survival_overrides_code_weakness(self):
+        code_review.LAST["e1"] = [RISK_STATE]
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("recovery 4s"))]
+        rsl = [result("e1", "redis", "kill", data_survived=True, recovery_s=4)]
+        self.assertEqual(patcher.make({"findings": fnd}, [exp("e1", "redis", "kill")], DEP, rsl)["patches"], [])
+
+    def test_one_patch_per_service_and_next_round_picks_the_next_fix(self):
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("no recovery measured", True))]
+        pln = [exp("e1", "redis", "kill")]
+        rnd = lambda exc=(): [(itm["fix"], itm["service"]) for itm in
+                              patcher.make({"findings": fnd}, pln, DEP, exclude=exc)["patches"]]
+        self.assertEqual(rnd(), [("redis_aof", "redis")])
+        self.assertEqual(rnd(["redis_aof"]), [("restart_policy", "redis")])
+        self.assertEqual(rnd(["redis:redis_aof"]), [("restart_policy", "redis")])
+        first = patcher.make({"findings": fnd}, pln, DEP)["patches"]
+        self.assertEqual(rnd(first), [("restart_policy", "redis")])  # earlier patch dicts work too
+        self.assertEqual(rnd(["redis_aof", "restart_policy"]), [])
+        self.assertEqual(rnd(["mongodb:redis_aof"]), [("redis_aof", "redis")])
+
+    def test_one_patch_per_service_across_experiments(self):
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("recovery 30s", True)),
+               dict(finding(2, "e2", "redis"), evidence=evd("no recovery measured")),
+               dict(finding(3, "e3", "mongodb"), evidence=evd("no recovery measured"))]
+        pln = [exp("e1", "redis", "kill"), exp("e2", "redis", "kill"), exp("e3", "mongodb", "kill")]
+        pch = patcher.make({"findings": fnd}, pln, DEP)
+        self.assertEqual([(itm["id"], itm["fix"], itm["service"]) for itm in pch["patches"]],
+                         [("p1", "redis_aof", "redis"), ("p2", "restart_policy", "mongodb")])
+
+    def test_every_patch_uses_the_fix_allowlist_and_depmap_services(self):
+        code_review.LAST.update(e1=[RISK_STATE], e2=[RISK_FLAG])
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("no recovery measured", True)),
+               dict(finding(2, "e2", "mongodb"), evidence=evd("recovery 30s"))]
+        pch = self.make(fnd, [exp("e1", "redis", "kill"), exp("e2", "mongodb", "kill")])
+        nam = {svc["name"] for svc in DEP["services"]}
+        self.assertTrue(pch["patches"])
+        for itm in pch["patches"]:
+            self.assertIn(itm["fix"], patcher.FIXES)
+            self.assertIn(itm["service"], nam)
+        self.assertNotIn("override", pch)
+        self.assertEqual([itm["id"] for itm in pch["patches"]], [f"p{idx}" for idx in range(1, len(pch["patches"]) + 1)])
 
 
 class Planner(Isolated):
@@ -161,34 +214,96 @@ class Planner(Isolated):
         self.assertEqual({exp["fault"] for exp in pln}, set(planner.CORE))
         self.assertEqual([(exp["id"], exp["rank"]) for exp in pln], [("e1", 1), ("e2", 2), ("e3", 3)])
 
-    def test_latency_only_after_core_faults(self):
-        pln = [exp("e1", "mongodb", "latency"), exp("e2", "redis", "kill"), exp("e3", "rabbitmq", "pause")]
+    def test_top_ranked_experiment_is_never_changed(self):
+        pln = [exp("e1", "mongodb", "latency"), exp("e2", "redis", "kill"), exp("e3", "catalogue", "kill")]
         out = planner.diversify(pln, DEP, BAS, 3)
-        self.assertEqual({exp["fault"] for exp in out}, set(planner.CORE))
-        out = planner.diversify([exp("e1", "mongodb", "latency"), exp("e2", "redis", "kill"),
-                                 exp("e3", "rabbitmq", "pause")], DEP, BAS, 4)
-        self.assertEqual([exp["fault"] for exp in out][3], "latency")
-        self.assertEqual({exp["fault"] for exp in out[:3]}, set(planner.CORE))
+        self.assertEqual((out[0]["target"], out[0]["fault"]), ("mongodb", "latency"))
+        self.assertEqual((out[1]["target"], out[1]["fault"]), ("redis", "kill"))
+        self.assertEqual(out[2]["fault"], "pause")  # the lower-ranked duplicate kill was diversified
+        self.assertEqual(len({exp["fault"] for exp in out}), 3)
 
-    def test_extra_target_is_new_healthy_and_fits_the_fault(self):
-        pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "pause"), exp("e3", "rabbitmq", "kill")]
-        out = planner.diversify(pln, DEP, dict(BAS, health=dict(BAS["health"], catalogue="unhealthy")), 3)
+    def test_redis_state_loss_kill_is_protected_even_when_ranked_low(self):
+        pln = [exp("e1", "mongodb", "pause"), exp("e2", "catalogue", "kill"), exp("e3", "redis", "kill")]
+        code_review.LAST["e3"] = [RISK_STATE]
+        out = planner.diversify(pln, DEP, BAS, 3)
+        self.assertIn(("redis", "kill"), [(exp["target"], exp["fault"]) for exp in out])
+        self.assertNotIn(("catalogue", "kill"), [(exp["target"], exp["fault"]) for exp in out])
         new = out[-1]
         self.assertEqual(new["fault"], "cpu_stress")
-        self.assertEqual(new["target"], "user")  # highest-centrality healthy app not already planned (web, payment)
-        self.assertEqual([exp["target"] for exp in out[:2]], ["redis", "mongodb"])  # code picks keep their rank
+        self.assertEqual(new["target"], "catalogue")  # app service with the highest centrality not left in the plan
+        self.assertEqual(code_review.risks_for(next(exp["id"] for exp in out if exp["target"] == "redis")), [RISK_STATE])
+
+    def test_pause_goes_on_a_db_and_cpu_stress_on_an_app(self):
+        dep = dict(DEP, services=DEP["services"] + [{"name": "mysql", "kind": "db", "depends_on": []}])
+        bas = dict(BAS, health=dict(BAS["health"], mysql="healthy"))
+        pln = [exp("e1", "redis", "kill"), exp("e2", "rabbitmq", "kill"), exp("e3", "catalogue", "kill")]
+        out = planner.diversify(pln, dep, bas, 3)
+        knd = {svc["name"]: svc["kind"] for svc in dep["services"]}
+        got = {exp["fault"]: knd[exp["target"]] for exp in out[1:]}
+        self.assertEqual(got, {"pause": "db", "cpu_stress": "app"})
+
+    def test_data_loss_kill_ranks_first(self):
+        pln = [exp("e1", "mongodb", "pause"), exp("e2", "catalogue", "cpu_stress"), exp("e3", "redis", "kill")]
+        code_review.LAST["e3"] = [RISK_STATE]
+        out = planner.diversify(pln, DEP, BAS, 3)
+        self.assertEqual([(exp["target"], exp["fault"]) for exp in out],
+                         [("redis", "kill"), ("mongodb", "pause"), ("catalogue", "cpu_stress")])
+        self.assertEqual(code_review.risks_for("e1"), [RISK_STATE])
+
+    def test_no_latency_unless_allowed(self):
+        self.assertNotIn("latency", planner.faults())
+        pln = planner.no_latency([exp("e1", "mongodb", "latency")])
+        self.assertEqual((pln[0]["fault"], pln[0]["params"]), ("pause", planner.PRM["pause"]))
+        bad = {"experiments": [{"target": "mongodb", "fault": "latency", "params": {"duration_s": 30, "delay_ms": 500},
+                                "risk": "high", "rank": 1, "reason": "r", "hypothesis": "h"}]}
+        with self.assertRaises(ValueError):
+            planner.validate(bad, DEP, BAS)
+        lat = dict(RISK_TMO, dependency="mongodb", fault="latency", weakness="slow queries", fix="add timeouts")
+        pln = code_review.to_plan({"risks": [lat]}, DEP, BAS, planner.centrality(DEP), 3)
+        self.assertEqual(pln[0]["fault"], "pause")
+        web = dict(DEP, services=[{"name": "web", "kind": "proxy", "depends_on": []}], edges=[])
+        self.assertEqual(planner.fallback(web, 1)[0]["fault"], "cpu_stress")
+        with mock.patch.dict(os.environ, {"CHAOS_ALLOW_LATENCY": "1"}):
+            self.assertIn("latency", planner.faults())
+            self.assertEqual(planner.no_latency([exp("e1", "mongodb", "latency")])[0]["fault"], "latency")
+            self.assertEqual(planner.validate(bad, DEP, BAS)[0]["fault"], "latency")
+
+    def test_review_adds_missed_state_loss_from_static_scan(self):
+        rev = {"source": "llm", "risks": [dict(RISK_TMO)]}
+        with mock.patch.object(code_review, "static_scan", lambda dep, src: [RISK_STATE, RISK_FLAG]):
+            out = code_review._with_state(rev, DEP, {})
+        self.assertEqual(out["risks"], [RISK_TMO, RISK_STATE])  # only the state-loss one is added
+        self.assertEqual(rev["risks"], [RISK_TMO])
+
+    def test_latency_moves_after_core_faults_unless_top(self):
+        pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "latency"), exp("e3", "rabbitmq", "pause")]
+        out = planner.diversify(pln, DEP, BAS, 4)
+        self.assertEqual([exp["fault"] for exp in out], ["kill", "pause", "latency"])
 
     def test_code_risks_follow_renumbered_experiments(self):
-        pln = [exp("e1", "mongodb", "latency"), exp("e2", "redis", "kill"), exp("e3", "rabbitmq", "pause")]
-        code_review.LAST.update(e2=[RISK_STATE], e3=[RISK_TMO])
+        pln = [exp("e1", "redis", "kill"), exp("e2", "rabbitmq", "kill"), exp("e3", "mongodb", "latency")]
+        code_review.LAST.update(e1=[RISK_STATE], e2=[RISK_TMO])
         out = planner.diversify(pln, DEP, BAS, 3)
         byt = {exp["target"]: exp["id"] for exp in out}
         self.assertEqual(code_review.risks_for(byt["redis"]), [RISK_STATE])
-        self.assertEqual(code_review.risks_for(byt["rabbitmq"]), [RISK_TMO])
+        if "rabbitmq" in byt:
+            self.assertEqual(code_review.risks_for(byt["rabbitmq"]), [RISK_TMO])
 
     def test_small_plans_are_left_alone(self):
         pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "kill")]
         self.assertEqual([exp["fault"] for exp in planner.diversify(pln, DEP, BAS, 2)], ["kill", "kill"])
+
+    def test_code_review_keeps_redis_state_loss_as_kill(self):
+        tmo = dict(RISK_STATE, fault="pause", weakness="redis calls have no timeout", fix="add timeouts", weight=5)
+        sta = dict(RISK_STATE, fault="pause")  # even if mislabelled pause, a state weakness is tested by a kill
+        pln = code_review.to_plan({"risks": [tmo, sta]}, DEP, BAS, planner.centrality(DEP), 3)
+        self.assertEqual([(exp["target"], exp["fault"]) for exp in pln], [("redis", "kill")])
+
+    def test_code_review_ties_go_to_kill(self):
+        pau = dict(RISK_TMO, dependency="redis", fault="pause", weight=3)
+        kil = dict(RISK_FLAG, dependency="redis", fault="kill", weight=3)
+        pln = code_review.to_plan({"risks": [pau, kil]}, DEP, BAS, planner.centrality(DEP), 3)
+        self.assertEqual(pln[0]["fault"], "kill")
 
 
 class DataLoss(Isolated):
@@ -198,7 +313,14 @@ class DataLoss(Isolated):
         self.assertEqual(itm["severity"], "high")
         self.assertRegex(itm["weakness"].lower(), "data loss")
         self.assertIn("data_survived false", itm["evidence"])
-        self.assertTrue(patcher.OUT.exists())
+        self.assertFalse(patcher.OUT.exists())  # the analyst never writes patch.json
+
+    def test_analyst_makes_one_llm_call_only(self):
+        res = result("e1", "redis", "kill", err=0.01, data_survived=False)
+        cal = []
+        with mock.patch.object(analyst.llm, "ask_json", lambda *a, **kw: cal.append(1) or 1 / 0):
+            analyst.analyze(DEP, BAS, [res], [exp("e1", "redis", "kill")])
+        self.assertEqual(len(cal), 1)
 
     def test_llm_cannot_downgrade_data_loss(self):
         res = result("e1", "redis", "kill", err=0.01, data_survived=False)
