@@ -15,10 +15,12 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setattr(guard, "STP", tmp_path / "STOP")
     monkeypatch.setattr(guard, "ACT", tmp_path / "active_faults.json")
     guard.reset()
+    guard._ctx.update(target=None, blast=None)
     guard._rev.clear()
     yield
     guard._rev.clear()
     guard.reset()
+    guard._ctx.update(target=None, blast=None)
 
 
 def exp(fault="kill", target="redis", **prm):
@@ -111,6 +113,14 @@ def test_approve_stashes_blast_radius_for_check():
     assert "ratings" in guard.check(smp(health={"ratings": "unhealthy"}), BAS, "redis")
     # a different target does not reuse the stash
     assert "cart" in guard.check(smp(health={"cart": "unhealthy"}), BAS, "mysql")
+
+
+def test_reset_keeps_blast_radius_from_approve():
+    assert guard.approve(exp(), DEP, mock=True) is None
+    guard.reset()
+    assert guard._ctx["blast"] == guard.blast_radius(DEP, "redis")
+    assert guard.check(smp(health={"cart": "unhealthy"}), BAS, "redis") is None
+    assert "ratings" in guard.check(smp(health={"ratings": "unhealthy"}), BAS, "redis")
 
 
 # kill switch
