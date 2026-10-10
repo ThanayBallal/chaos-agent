@@ -1,7 +1,8 @@
 """Live nodes for heal.graph on the real compose project robot-shop (python -m heal.run "..." --live).
 
 graph.run(..., live=True) puts NODES in place of the stubs of the same name and switches heal/ports.py to live;
-chaos_agent, remediation_agent, harden_agent, apply_hardening, compare and revert_patch stay shared (rule-based).
+chaos_agent, remediation_agent and the blind half of diagnosis_agent are the shared LLM agents (heal/agents.py, rule
+fallbacks); harden_agent, apply_hardening, compare and revert_patch stay shared too.
 Safety while healing: guard.approve (allowlist, depmap, live container), guard.ready before every injection, then
 ports.heal_check: kill switch, collateral outside the blast radius, and a hard HEAL_S deadline from injection.
 The error-rate and p95 aborts are off while healing (they are the symptoms being healed).
@@ -21,7 +22,8 @@ HEAL_S = MAX_DUR  # hard heal deadline, seconds from injection
 VERIFY_S = 20  # max seconds one verify waits for steady state (leaves time for a second attempt)
 READY_S = 30  # max seconds to wait for steady state before injecting
 DEP = graph.DAT / "depmap.json"
-MSD = ("window_s", "requests", "errors", "p50_ms", "endpoints", "health", "unhealthy", "cpu_pct", "netem", "logs")
+MSD = ("window_s", "requests", "errors", "p50_ms", "endpoints", "health", "unhealthy", "containers", "cpu_pct", "netem",
+       "logs")
 
 
 # ---- helpers ----
@@ -144,15 +146,6 @@ def understand(state, config):
     return {"depmap": dep, "baseline": bas, "app_model": mdl}
 
 
-def chaos_agent(state, config):
-    """Shared rule-based choice (top code-review risk), without stub markers."""
-    exp = dict(graph.chaos_agent(state, config)["experiment"])
-    exp.pop("stub", None)
-    if exp["reason"].startswith("STUB: "):
-        exp["reason"] = exp["reason"][len("STUB: "):]
-    return {"experiment": exp}
-
-
 def guard_approve(state, config):
     exp = state["experiment"]
     guard.reset()
@@ -182,21 +175,13 @@ def observe(state, config):
 
 
 def diagnosis_agent(state, config):
-    """Rule-based: suspects from the measured symptoms only; findings from analyst.fallback."""
-    exp, sym = state["experiment"], state["symptoms"]
-    msd, sus = sym["measured"], {}
-    for svc in msd.get("unhealthy", []):
-        sus.setdefault(svc, []).append(msd["health"][svc])
-    for svc, val in sorted((msd.get("cpu_pct") or {}).items()):
-        if val is not None and val >= live_check.CPU_BUSY:
-            sus.setdefault(svc, []).append(f"cpu {val}% of one core")
-    for svc in msd.get("netem", []):
-        sus.setdefault(svc, []).append("netem qdisc")
-    why = ("; ".join(f"{svc}: {', '.join(itm)}" for svc, itm in sus.items()) if sus
-           else f"no unhealthy service measured; error_rate {sym['error_rate']}")
-    fnd = _findings(state["depmap"], state["baseline"], sym, exp)
-    log("diagnosis_agent", why)
-    return {"diagnosis": {"root_cause": why, "suspects": sorted(sus), "findings": fnd}}
+    """Shared blind diagnosis (graph.diagnosis_agent: symptoms + depmap only, scored afterwards), with findings for
+    harden_agent from analyst.fallback on the measured result (post-hoc, never shown to the diagnosis)."""
+    out = _unstub(graph.diagnosis_agent)(state, config)
+    if out.get("diagnosis"):
+        out["diagnosis"]["findings"] = _findings(state["depmap"], state["baseline"], state["symptoms"],
+                                                 state["experiment"])
+    return out
 
 
 def apply_fix(state, config):
@@ -292,5 +277,6 @@ def guard_revert(state, config):
 
 
 NODES = {fnc.__name__: fnc for fnc in (
-    understand, chaos_agent, guard_approve, inject, observe, diagnosis_agent, _unstub(graph.remediation_agent),
+    understand, _unstub(graph.chaos_agent), guard_approve, inject, observe, diagnosis_agent,
+    _unstub(graph.remediation_agent),
     apply_fix, verify, rerun, guard_revert)}

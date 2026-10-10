@@ -11,6 +11,10 @@ Harden (make the app survive the fault next time, at most MAX_ROUNDS):
 remediation_agent / apply_fix may only use HEAL_CATALOG actions; hardening patches (patcher.make output) only
 appear in harden_agent / apply_hardening. revert_patch only runs between round 1 and round 2.
 guard_revert undoes injected faults only, never patches.
+chaos_agent, diagnosis_agent and remediation_agent are LLM agents (heal/agents.py) with rule-based fallbacks; which
+one answered is kept per call in state["agents"]. diagnosis_agent is blind (symptoms + depmap only) and is scored
+against the experiment afterwards (state["diagnosis_score"]). On a retry the first diagnosis stands and
+remediation_agent gets the previous diagnosis, the actions taken and the new symptoms.
 Abort (live only: not steady, injection failed, kill switch, collateral outside the blast radius, 60 s heal deadline):
   inject / observe -> (abort) guard_revert; verify -> (abort) give_up -> guard_revert.
 
@@ -21,27 +25,23 @@ Stub knobs in config["configurable"]: scenario = retry (default) | healed | unhe
 harden = round1 (default) | round2 | never (which hardening round improves). Both are ignored in live mode.
 """
 import json
+import time
 from pathlib import Path
 from typing import TypedDict
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
-from heal import ports
-from safety.allowlist import FAULTS
+from heal import agents, ports
+from heal.agents import HEAL, HEAL_CATALOG, HEAL_DESC, WEB, check_heal, heal_plan  # noqa: F401 (re-exported)
 
 DAT = Path(__file__).resolve().parent.parent / "data"
 MAX_ATTEMPTS = 2  # contracts.md: at most 2 fix attempts per run
 MAX_ROUNDS = 2  # hardening rounds
 SCENARIOS = ("retry", "healed", "unhealed", "rejected")
 HARDEN = ("round1", "round2", "never")
-WEB = "web"  # nginx proxy: caches backend IPs, so it is restarted after any backend restart
-HEAL = {"kill": "start_service", "pause": "unpause_service", "latency": "remove_latency",
-        "cpu_stress": "stop_cpu_stress"}
-HEAL_CATALOG = (*HEAL.values(), "restart_web")
-DFL_EXP = {"id": "e1", "target": "redis", "fault": "kill", "params": {"duration_s": 30}, "risk": "high", "rank": 1,
-           "reason": "STUB: default experiment (no code-review risk)",
-           "hypothesis": "cart requests fail while redis is down; recovers after restart"}
+LLM_S = 15  # live: max seconds per heal-agent LLM call (diagnosis, remediation)
+RESERVE_S = 25  # live: seconds of the heal deadline kept for apply_fix + verify
 
 
 class HealState(TypedDict, total=False):
@@ -67,6 +67,9 @@ class HealState(TypedDict, total=False):
     abort: str
     heal: dict
     observed: list
+    agents: dict
+    diagnosis_score: dict
+    hardening_log: list
 
 
 def log(nam, msg):
@@ -79,30 +82,6 @@ def _knob(config, key, dfl):
 
 def _load(nam):
     return json.loads((DAT / nam).read_text())
-
-
-# ---- heal catalog ----
-
-def heal_plan(fault, target):
-    """Catalog actions that undo `fault` on `target`; restart_web last whenever a backend was restarted."""
-    act = [{"action": HEAL[fault], "target": target}]
-    if HEAL[fault] == "start_service" and target != WEB:
-        act.append({"action": "restart_web", "target": WEB})
-    return act
-
-
-def check_heal(act):
-    """Raise ValueError unless every action is in HEAL_CATALOG and restart_web is last after a backend restart."""
-    for itm in act:
-        if itm.get("action") not in HEAL_CATALOG:
-            raise ValueError(f"'{itm.get('action')}' is not a heal action {HEAL_CATALOG}; "
-                             f"hardening patches belong in harden_agent")
-    web = [idx for idx, itm in enumerate(act) if itm["action"] == "restart_web"]
-    if any(itm["action"] == "start_service" and itm.get("target") != WEB for itm in act) and web != [len(act) - 1]:
-        raise ValueError("restart_web must be the last action after a backend restart (nginx caches backend IPs)")
-    if web and web != [len(act) - 1]:
-        raise ValueError("restart_web may appear once, as the last action")
-    return act
 
 
 # ---- routing (pure functions of the state) ----
@@ -153,20 +132,28 @@ def understand(state, config: RunnableConfig):
     return {"depmap": dep, "baseline": bas, "app_model": mdl}
 
 
+def _agents(state, nam, met):
+    """state["agents"] with one more call of agent nam: {"source": "llm"|"fallback", "why"}."""
+    out = {key: list(val) for key, val in (state.get("agents") or {}).items()}
+    out.setdefault(nam, []).append(met)
+    return out
+
+
+def _cap(state):
+    """Live: seconds a heal agent's LLM call may take, keeping RESERVE_S of the heal deadline for apply_fix + verify.
+    Stub (no deadline): None = ask_json's default cap."""
+    unt = (state.get("heal") or {}).get("until")
+    return None if unt is None else min(LLM_S, unt - time.monotonic() - RESERVE_S)
+
+
 def chaos_agent(state, config: RunnableConfig):
-    """STUB: turn the top code-review risk into one plan.json experiment."""
-    nam = {svc["name"] for svc in (state.get("depmap") or {}).get("services", [])}
-    rsk = next((itm for itm in (state.get("app_model") or {}).get("risks", [])
-                if itm.get("dependency") in nam and itm.get("fault") in FAULTS), None)
-    if rsk:
-        exp = {"id": "e1", "target": rsk["dependency"], "fault": rsk["fault"], "params": dict(rsk["params"]),
-               "risk": "high", "rank": 1, "reason": f"code review: {rsk['file']}:{rsk['line']} {rsk['weakness']}"[:600],
-               "hypothesis": rsk["hypothesis"]}
-    else:
-        exp = dict(DFL_EXP, params=dict(DFL_EXP["params"]))
+    """LLM: one experiment from the prompt (what it names wins), the code-review risks and the depmap; guard.approve
+    rejections are fed back to the LLM. Fallback: the prompt's target/fault, else the top code-review risk."""
+    exp, met = agents.plan_experiment(state.get("prompt") or "", (state.get("app_model") or {}).get("risks", []),
+                                      state["depmap"])
     exp["stub"] = True
-    log("chaos_agent", f"{exp['fault']} {exp['target']} {exp['params']}")
-    return {"experiment": exp}
+    log("chaos_agent", f"[{met['source']}] {exp['fault']} {exp['target']} {exp['params']}: {exp['reason'][:120]}")
+    return {"experiment": exp, "agents": _agents(state, "chaos_agent", met)}
 
 
 def guard_approve(state, config: RunnableConfig):
@@ -184,39 +171,81 @@ def inject(state, config: RunnableConfig):
                          "stub": True}}
 
 
+def _stub_measured(exp, bas):
+    """STUB world: what ports.observe would measure while exp's fault is active (the stub may know the fault; the
+    diagnosis agent still only sees agents.brief of it)."""
+    tgt, fal = exp["target"], exp["fault"]
+    hlt = {svc: "healthy" for svc in bas.get("health", {})}
+    msd = {"health": hlt, "containers": {svc: "running" for svc in hlt}, "cpu_pct": {}, "netem": [], "logs": {},
+           "endpoints": {}}
+    if fal == "kill":
+        hlt[tgt], msd["containers"][tgt] = "unhealthy", "exited"
+        msd["logs"][tgt] = ["STUB: container exited with code 137"]
+    elif fal == "pause":
+        hlt[tgt] = msd["containers"][tgt] = "paused"
+    elif fal == "latency":
+        msd["netem"] = [tgt]
+    else:
+        msd["cpu_pct"][tgt] = 190.0
+    msd["unhealthy"] = sorted(svc for svc, sta in hlt.items() if sta != "healthy")
+    return msd
+
+
 def observe(state, config: RunnableConfig):
-    """STUB: result.json-like symptoms; worse before any heal attempt, better after one."""
+    """STUB: result.json-like symptoms plus "measured"; worse before any heal attempt, better after one."""
     exp, att = state["experiment"], state.get("attempts", 0)
     sym = {"id": exp["id"], "target": exp["target"], "fault": exp["fault"],
            "error_rate": 0.62 if att == 0 else 0.31, "p95_ms": 2400 if att == 0 else 900,
            "recovery_s": 14 if att == 0 else 8, "aborted": False, "abort_reason": None,
            "data_survived": False, "observations": [f"STUB: {exp['target']} dependents return 5xx"],
-           "stub": True}
+           "measured": _stub_measured(exp, state["baseline"]), "stub": True}
     log("observe", f"attempt {att}: error_rate={sym['error_rate']} p95={sym['p95_ms']}ms")
     return {"symptoms": sym}
 
 
-def diagnosis_agent(state, config: RunnableConfig):
-    """STUB: root cause plus a findings.json-shaped dict that patcher.make consumes."""
+def _stub_findings(state):
+    """STUB findings.json for harden_agent (post-hoc analysis, not part of the blind diagnosis)."""
     exp, sym = state["experiment"], state["symptoms"]
     rsk = next((itm for itm in (state.get("app_model") or {}).get("risks", [])
                 if itm.get("dependency") == exp["target"] and itm.get("fault") == exp["fault"]), None)
-    wek = rsk["weakness"] if rsk else f"single {exp['target']} instance with no fallback"
-    fix = rsk["fix"] if rsk else "add restart: unless-stopped + healthcheck"
-    fnd = {"resilience_score": 50, "findings": [{
-        "rank": 1, "severity": "critical", "target": exp["target"], "experiment": exp["id"], "weakness": wek,
+    return {"resilience_score": 50, "findings": [{
+        "rank": 1, "severity": "critical", "target": exp["target"], "experiment": exp["id"],
+        "weakness": rsk["weakness"] if rsk else f"single {exp['target']} instance with no fallback",
         "evidence": f"STUB: error_rate {state['baseline'].get('error_rate')} -> {sym['error_rate']}",
-        "hypothesis_matched": True, "fix": fix}]}
-    log("diagnosis_agent", wek)
-    return {"diagnosis": {"root_cause": wek, "findings": fnd, "stub": True}}
+        "hypothesis_matched": True, "fix": rsk["fix"] if rsk else "add restart: unless-stopped + healthcheck"}]}
+
+
+def diagnosis_agent(state, config: RunnableConfig):
+    """BLIND LLM diagnosis: agents.diagnose sees agents.brief(symptoms, baseline) and the depmap, never the
+    experiment; then it is scored against the experiment. findings (for harden_agent) are added separately.
+    On a retry the first diagnosis stands (no LLM call): remediation_agent gets the new symptoms instead."""
+    if state.get("attempts", 0) and (state.get("diagnosis") or {}).get("fault_guess"):
+        log("diagnosis_agent", "retry: keeping the first diagnosis")
+        return {}
+    dx, met = agents.diagnose(agents.brief(state["symptoms"], state["baseline"]), state["depmap"], cap=_cap(state))
+    scr = agents.score(dx, state["experiment"])
+    why = f"{dx['fault_guess']} on {dx['suspect_service']}: " + "; ".join(dx["evidence"][:2])
+    log("diagnosis_agent", f"[{met['source']}] {why} (confidence {dx['confidence']}, correct={scr['correct']})")
+    return {"diagnosis": {**dx, "root_cause": why, "findings": _stub_findings(state), "stub": True},
+            "diagnosis_score": scr, "agents": _agents(state, "diagnosis_agent", met)}
 
 
 def remediation_agent(state, config: RunnableConfig):
-    """STUB: pick heal actions from HEAL_CATALOG that undo the injected fault now (never hardening patches)."""
-    exp = state["experiment"]
-    act = check_heal(heal_plan(exp["fault"], exp["target"]))
-    log("remediation_agent", " -> ".join(f"{itm['action']}({itm['target']})" for itm in act))
-    return {"fix_plan": {"actions": act, "stub": True}}
+    """LLM: HEAL_CATALOG actions that undo the diagnosed fault now (never hardening patches); restart_web is appended
+    automatically after a backend start. Attempt 2 also gets the previous diagnosis, actions taken, new symptoms."""
+    dx, att = state["diagnosis"], state.get("attempts", 0)
+    his = None
+    if att:
+        his = {"previous_diagnosis": {key: dx.get(key) for key in agents.DX_KEYS},
+               "actions_taken": [{key: itm.get(key) for key in ("attempt", "action", "target", "ok", "detail")}
+                                 for itm in state.get("applied_fixes") or []],
+               "new_symptoms": agents.brief(state["symptoms"], state["baseline"])}
+    pln, met = agents.remediate(dx, state["depmap"], his, cap=_cap(state))
+    act = check_heal(pln["actions"])
+    log("remediation_agent", f"[{met['source']}] " + (" -> ".join(f"{itm['action']}({itm['target']})" for itm in act)
+                                                     or "no action"))
+    return {"fix_plan": {"actions": act, "reason": pln.get("reason"), "stub": True},
+            "agents": _agents(state, "remediation_agent", met)}
 
 
 def apply_fix(state, config: RunnableConfig):
@@ -270,7 +299,9 @@ def apply_hardening(state, config: RunnableConfig):
     ports.apply(hrd["patch"])
     ids = [itm["id"] for itm in hrd["patch"].get("patches", [])]
     log("apply_hardening", f"round {rnd}: applied {', '.join(ids) or 'nothing'}")
-    out = {"hardening": {**hrd, "applied": ids}}
+    out = {"hardening": {**hrd, "applied": ids},
+           "hardening_log": list(state.get("hardening_log") or []) + [
+               {"round": rnd, "patches": [f"{itm['fix']} {itm['service']}" for itm in hrd["patch"].get("patches", [])]}]}
     if rnd == 1:
         out["round1_patches"] = list(hrd["patch"].get("patches", []))
     return out
@@ -307,8 +338,9 @@ def revert_patch(state, config: RunnableConfig):
 
 
 def report(state, config: RunnableConfig):
-    """Summarise the run, with every hardening comparison."""
-    exp, cmp = state.get("experiment") or {}, state.get("comparisons") or []
+    """Summarise the run: prompt -> experiment -> blind diagnosis (correct?) -> heal actions -> healed in Xs ->
+    hardening rounds -> which agents used the LLM and which the fallback."""
+    exp, cmp, dxs = state.get("experiment") or {}, state.get("comparisons") or [], state.get("diagnosis") or {}
     if exp.get("rejection"):
         out = "rejected"
     elif (state.get("verify") or {}).get("healed"):
@@ -323,7 +355,17 @@ def report(state, config: RunnableConfig):
            "experiment": exp.get("id"), "target": exp.get("target"), "attempts": state.get("attempts", 0),
            "rounds": state.get("round", 0), "comparisons": cmp, "abort": state.get("abort"),
            "applied_fixes": state.get("applied_fixes") or [],
-           "score": cmp[-1]["score"] if cmp else None, "stub": not _knob(config, "live", False)}
+           "score": cmp[-1]["score"] if cmp else None, "stub": not _knob(config, "live", False),
+           "experiment_detail": {key: exp.get(key) for key in ("target", "fault", "params", "reason", "hypothesis",
+                                                               "rejection")} if exp else None,
+           "diagnosis": {key: dxs.get(key) for key in agents.DX_KEYS} if dxs.get("fault_guess") else None,
+           "diagnosis_correct": (state.get("diagnosis_score") or {}).get("correct"),
+           "diagnosis_score": state.get("diagnosis_score"),
+           "healed_in_s": (state.get("verify") or {}).get("recovery_s") if out == "healed" else None,
+           "hardening_rounds": [{**itm, "improved": improved(cmp[idx]) if idx < len(cmp) else None}
+                                for idx, itm in enumerate(state.get("hardening_log") or [])],
+           "agents": {nam: [met["source"] for met in mets] for nam, mets in (state.get("agents") or {}).items()},
+           "agents_detail": state.get("agents") or {}}
     log("report", f"outcome={out} hardening={hrd} attempts={rpt['attempts']} rounds={rpt['rounds']}")
     return {"report": rpt}
 

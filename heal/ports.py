@@ -217,7 +217,7 @@ def _tail(con):
 
 def observe(bas):
     """Measured symptoms of the whole app, with no knowledge of the experiment: OBS_S s of traffic (error_rate, p95,
-    per endpoint), docker health, cpu % (live_check) and netem (fixes.has_netem) per running container, last LOG_N log lines of unhealthy services."""
+    per endpoint), docker health, container status, cpu % (live_check) and netem (fixes.has_netem) per running container, last LOG_N log lines of unhealthy services."""
     _need_live("observe")
     from heal import fixes
     from monitor import baseline, injector, live_check
@@ -251,7 +251,8 @@ def observe(bas):
     log("observe", f"error_rate={smp['error_rate']} p95={smp['p95_ms']}ms unhealthy={bad or 'none'}")
     return {"window_s": OBS_S, "requests": smp["requests"], "errors": smp["errors"], "error_rate": smp["error_rate"],
             "p50_ms": smp["p50_ms"], "p95_ms": smp["p95_ms"], "endpoints": smp["endpoints"], "health": hlt,
-            "unhealthy": bad, "cpu_pct": cpu, "netem": sorted(svc for svc, val in net.items() if val),
+            "unhealthy": bad, "containers": {svc: con.status for svc, con in sorted(cons.items())}, "cpu_pct": cpu,
+            "netem": sorted(svc for svc, val in net.items() if val),
             "logs": logs, "observations": obs}
 
 
