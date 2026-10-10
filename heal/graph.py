@@ -15,6 +15,8 @@ Live runs write the full report to data/heal_report.json (never in stub mode).
 Mode (state["mode"], recorded in the report): "prompt" (default) or "auto" (run(None, ..., auto=True), heal.run --auto).
   In auto mode chaos_agent prints the top code-review weaknesses (code read from the files themselves) and plans the
   top-ranked one the guard approves (agents.plan_auto, at most agents.AUTO_TRY); everything after it is the same.
+  Campaign (heal/campaign.py, heal.run --auto --all): one run per weakness with run(..., ctx=, pick=): understand
+  returns the campaign's one-time result and chaos_agent plans exactly weakness pick["rank"] (agents.plan_pick).
 
 remediation_agent / apply_fix may only use HEAL_CATALOG actions; hardening patches (patcher.make output) only
 appear in harden_agent / apply_hardening. revert_patch only runs between round 1 and round 2.
@@ -65,6 +67,7 @@ REC_GAIN, REC_GAIN_S = 0.30, 10  # hardening: recovery_s must drop >= 30% AND >=
 REPORT = DAT / "heal_report.json"  # live runs only
 NO_FIX = "no hardening fix available for this fault"
 KILL = "kill switch (STOP file)"
+CTRL_C = "Ctrl+C during the hold"
 HOLD_S = 90  # hold: max seconds before healing starts on its own
 STATUS_S = 5  # hold: seconds between container-state lines
 TICK_S = 0.2  # hold: poll interval for Enter / STOP / Ctrl+C
@@ -100,6 +103,7 @@ class HealState(TypedDict, total=False):
     stopped: str
     mode: str
     auto: dict
+    pick: dict
 
 
 def log(nam, msg):
@@ -231,8 +235,25 @@ def show_weaknesses(wks, mdl):
         print("   no weakness whose file:line could be read from the source")
 
 
+def _pick_chaos(state):
+    """Campaign cycle (state["pick"] = {"rank", "of"}): plan exactly that weakness from the campaign's list (already
+    shown once by heal.campaign); a guard rejection goes to report like any rejection."""
+    pck, wks = state["pick"], (state.get("auto") or {}).get("weaknesses") or []
+    wek = next(itm for itm in wks if itm["rank"] == pck["rank"])
+    exp, met, skp = agents.plan_pick(wek, pck["of"], state["depmap"])
+    chs = None if skp else wek["rank"]
+    print(f"== Auto: weakness #{wek['rank']} of {pck['of']}: {exp['fault']} {exp['target']}" if chs
+          else f"== Auto: {exp['rejection']}")
+    exp["stub"] = True
+    log("chaos_agent", f"[{met['source']}] {exp['fault']} {exp['target']} {exp['params']}: {exp['reason'][:120]}")
+    return {"experiment": exp, "agents": _agents(state, "chaos_agent", met),
+            "auto": {"weaknesses": wks, "skipped": [skp] if skp else [], "chosen": chs}}
+
+
 def _auto_chaos(state):
     """Auto mode: show the weaknesses, then plan the top-ranked one the guard approves."""
+    if state.get("pick"):
+        return _pick_chaos(state)
     mdl = state.get("app_model") or {}
     wks = agents.weaknesses(mdl.get("risks", []), state["depmap"])
     show_weaknesses(wks, mdl)
@@ -316,7 +337,7 @@ def hold(state, config: RunnableConfig):
             if guard.kill_switch():
                 abr = KILL
             elif ctl.is_set():
-                abr = "Ctrl+C during the hold"
+                abr = CTRL_C
             elif evt.is_set():
                 why = "enter"
             elif now - t_0 < HOLD_S:
@@ -542,7 +563,7 @@ def report(state, config: RunnableConfig):
     aut = state.get("auto") or {}
     rpt = {**(state.get("report") or {}), "prompt": state.get("prompt"), "mode": state.get("mode") or "prompt",
            "weaknesses": aut.get("weaknesses"), "auto": {key: aut.get(key) for key in ("chosen", "skipped")} if aut
-           else None, "outcome": out, "hardening": hrd,
+           else None, **({"campaign": state["pick"]} if state.get("pick") else {}), "outcome": out, "hardening": hrd,
            "experiment": exp.get("id"), "target": exp.get("target"), "attempts": state.get("attempts", 0),
            "rounds": state.get("round", 0), "comparisons": cmp, "abort": state.get("abort"),
            "stopped": state.get("stopped"), "held_s": (state.get("heal") or {}).get("held_s"),
@@ -628,14 +649,27 @@ def build(nodes=None, hold=False):
     return grf.compile()
 
 
-def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, baseline_s=30, hold=False, auto=False):
+def given(ctx):
+    """An understand node that returns an earlier understand result (heal.campaign: understand runs once)."""
+    def understand(state, config):
+        log("understand", "reusing the campaign's depmap, baseline and code review")
+        return {key: ctx[key] for key in ("depmap", "baseline", "app_model")}
+    return understand
+
+
+def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, baseline_s=30, hold=False, auto=False,
+        ctx=None, pick=None, save=True):
     """Run the graph once. Return (final_state, path) where path lists the nodes in the order they ran.
     live=True: real nodes from heal/live.py (nodes= still overrides them), real ports, baseline_s s baseline;
     injected faults are reverted and traffic stopped when the run ends, however it ends; the report is written to
-    data/heal_report.json (live only). hold=True: wait for Enter (or HOLD_S) after injection, see hold().
-    auto=True: no prompt (must be None); the chaos agent picks a code-review weakness itself (mode "auto")."""
+    data/heal_report.json (live only, unless save=False). hold=True: wait for Enter (or HOLD_S) after injection.
+    auto=True: no prompt (must be None); the chaos agent picks a code-review weakness itself (mode "auto").
+    Campaign cycle (heal.campaign): ctx = {"depmap", "baseline", "app_model", "weaknesses"} replaces understand,
+    pick = {"rank", "of"} forces that weakness (auto only)."""
     if auto and prompt is not None:
         raise ValueError("auto mode takes no prompt")
+    if pick and not (auto and ctx):
+        raise ValueError("pick needs auto=True and ctx")
     if scenario not in SCENARIOS:
         raise ValueError(f"scenario '{scenario}' not one of {SCENARIOS}")
     if harden not in HARDEN:
@@ -648,12 +682,16 @@ def run(prompt, scenario="retry", nodes=None, harden="round1", live=False, basel
         from heal import live as lmd
         ports.use_live(True)
         nodes = {**lmd.NODES, **(nodes or {})}
+    if ctx:
+        nodes = {**(nodes or {}), "understand": given(ctx)}
+    if pick:
+        sta.update(pick=dict(pick), auto={"weaknesses": ctx["weaknesses"]})
     try:
         for upd in build(nodes, hold=hold).stream(dict(sta), config=cfg, stream_mode="updates"):
             for nam, val in upd.items():
                 pth.append(nam)
                 sta.update(val or {})
-        if live and sta.get("report"):
+        if live and save and sta.get("report"):
             save_report(sta["report"], pth)
     finally:
         if lmd:

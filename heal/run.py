@@ -2,6 +2,8 @@
 python -m heal.run "prompt" --stub [--scenario retry|healed|unhealed|rejected] [--harden round1|round2|never]
 python -m heal.run "prompt" --live [--baseline-s 30] [--pause-before-heal]
 python -m heal.run --auto --live|--stub [--refresh]   (no prompt: the chaos agent picks the top code-review weakness)
+python -m heal.run --auto --all --live|--stub [--max N] [--pause-before-heal | --pause-first]
+    (campaign: one heal cycle per ranked weakness #1..#N, default N=4; see heal/campaign.py)
     (real robot-shop; STOP file or Ctrl+C reverts everything; --pause-before-heal holds the broken app after injection
     until Enter or 90 s, then heals with a fresh 60 s deadline)"""
 import argparse
@@ -9,7 +11,7 @@ import json
 import os
 import sys
 
-from heal import graph
+from heal import campaign, graph
 
 
 def _kept(val):
@@ -20,7 +22,10 @@ def show(rpt):
     """prompt -> experiment -> blind diagnosis (correct?) -> actions -> healed in Xs -> hardening -> LLM vs fallback."""
     exp, dxs = rpt.get("experiment_detail") or {}, rpt.get("diagnosis")
     aut = rpt.get("auto") or {}
-    if rpt.get("mode") == "auto":
+    if rpt.get("campaign"):
+        print(f"== Mode: auto campaign (weakness #{rpt['campaign']['rank']} of {rpt['campaign']['of']} "
+              f"from the code review)")
+    elif rpt.get("mode") == "auto":
         num, skp = len(rpt.get("weaknesses") or []), len(aut.get("skipped") or [])
         print(f"== Mode: auto (" + (f"chose weakness #{aut['chosen']} of {num}" if aut.get("chosen")
                                     else f"no weakness chosen of {num}") + f" from the code review, skipped {skp})")
@@ -81,6 +86,18 @@ def safe_output():
             pass
 
 
+def run_campaign(opt):
+    """--auto --all: the campaign; each cycle's report is shown as it ends, then the summary table."""
+    rpt = campaign.run(live=opt.live, scenario=opt.scenario, harden=opt.harden, baseline_s=opt.baseline_s,
+                       max_n=campaign.MAX_N if opt.max is None else opt.max, hold=opt.pause_before_heal,
+                       first=opt.pause_first, out=campaign.CAMPAIGN if opt.live else None,
+                       last=graph.REPORT if opt.live else None, each=show)
+    campaign.table(rpt)
+    if opt.live:
+        print(f"== Wrote {campaign.CAMPAIGN} (last cycle: {graph.REPORT})")
+    return 1 if (rpt.get("stopped") or "").startswith("error") else 0
+
+
 def main(argv=None):
     safe_output()
     arg = argparse.ArgumentParser(prog="python -m heal.run")
@@ -97,6 +114,12 @@ def main(argv=None):
     arg.add_argument("--refresh", action="store_true", help="redo the code review instead of reusing the cached one")
     arg.add_argument("--pause-before-heal", action="store_true",
                      help="live: after injection wait for Enter (or 90 s) before healing, kill switch armed")
+    arg.add_argument("--all", action="store_true",
+                     help="with --auto: campaign, one heal cycle per ranked code-review weakness #1..#N")
+    arg.add_argument("--max", type=int, default=None, metavar="N",
+                     help=f"with --all: test at most N weaknesses (default {campaign.MAX_N})")
+    arg.add_argument("--pause-first", action="store_true",
+                     help="live, with --all: pause before healing in cycle 1 only")
     try:
         opt = arg.parse_args(argv)
     except SystemExit as err:
@@ -107,14 +130,26 @@ def main(argv=None):
     if not (opt.stub or opt.live):
         print("choose --stub or --live", file=sys.stderr)
         return 2
-    if opt.pause_before_heal and not opt.live:
-        print("--pause-before-heal needs --live", file=sys.stderr)
+    if (opt.pause_before_heal or opt.pause_first) and not opt.live:
+        print("--pause-before-heal / --pause-first need --live", file=sys.stderr)
+        return 2
+    if opt.all and not opt.auto:
+        print("--all needs --auto", file=sys.stderr)
+        return 2
+    if (opt.max is not None or opt.pause_first) and not opt.all:
+        print("--max / --pause-first need --all", file=sys.stderr)
+        return 2
+    if opt.max is not None and opt.max < 1:
+        print("--max must be at least 1", file=sys.stderr)
         return 2
     if opt.refresh:
         os.environ["CHAOS_REVIEW_FRESH"] = "1"  # agent.code_review: skip the cached LLM review
     if opt.live:
         from safety import guard
         guard.install()  # stale STOP removed; Ctrl+C and exit revert every registered fault
+    if opt.all:
+        return run_campaign(opt)
+    if opt.live:
         sta, pth = graph.run(opt.prompt, live=True, baseline_s=opt.baseline_s, hold=opt.pause_before_heal,
                              auto=opt.auto)
     else:

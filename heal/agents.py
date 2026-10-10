@@ -272,10 +272,14 @@ def _auto_why(wek, skp):
             f"{wek['weakness']}")
 
 
-def auto_fallback(wek, num, skp=()):
-    """Rule-based experiment for weakness wek, with the autonomous reason."""
+def _campaign_why(wek):
+    return f"the campaign tests each ranked weakness in turn (weight {wek['weight']}): {wek['weakness']}"
+
+
+def auto_fallback(wek, num, skp=(), why=None):
+    """Rule-based experiment for weakness wek, with the autonomous reason (why replaces the default explanation)."""
     return {"id": "e1", "target": wek["dependency"], "fault": wek["fault"], "params": dict(wek["params"]),
-            "risk": "high", "rank": 1, "reason": (auto_tag(wek, num) + _auto_why(wek, skp))[:600],
+            "risk": "high", "rank": 1, "reason": (auto_tag(wek, num) + (why or _auto_why(wek, skp)))[:600],
             "hypothesis": wek["hypothesis"][:600]}
 
 
@@ -303,24 +307,47 @@ def plan_auto(wks, dep):
     replaced by the rule-based one. -> (exp, meta, skipped); exp carries "rejection" if nothing could be approved."""
     num, skp = len(wks), []
     for wek in wks[:AUTO_TRY]:
-        exp = auto_fallback(wek, num, skp)
-        rej = guard.approve(exp, dep, mock=not ports.live())
+        exp, met, rej = _plan_one(wek, num, dep, auto_fallback(wek, num, skp))
         if rej:
-            skp.append({"rank": wek["rank"], "where": f"{wek['file']}:{wek['line']}",
-                        "experiment": f"{wek['fault']} {wek['dependency']}", "why": f"rejected by the safety guard: {rej}"})
-            log("chaos_agent", f"auto: skipped weakness #{wek['rank']} ({wek['fault']} {wek['dependency']}): {rej}")
+            skp.append(skipped(wek, rej))
             continue
-        dat = {"weakness": {key: wek[key] for key in ("service", "dependency", "fault", "params", "file", "line", "code",
-                                                       "weakness", "hypothesis")},
-               "services": services(dep), "faults": {fal: sorted(prm) for fal, prm in FAULTS.items()},
-               "max_duration_s": MAX_DUR}
-        out, met = _ask("chaos_agent", CHAOS_AUTO_SYS, "Plan the experiment for this weakness. Data:", dat, CHAOS_SCHEMA,
-                        lambda raw: check_auto(raw, wek, num, dep))
-        return (out or exp), met, skp
+        return exp, met, skp
     why = (f"the safety guard rejected the top {len(skp)} weaknesses" if wks
            else "no code-review weakness could be read from the source")
     exp = auto_fallback(wks[len(skp) - 1], num, skp[:-1]) if skp else {**DFL_EXP, "params": dict(DFL_EXP["params"])}
     return {**exp, "rejection": f"autonomous mode: {why}"}, {"source": "fallback", "why": why}, skp
+
+
+def skipped(wek, rej):
+    """A weakness the safety guard rejected, as recorded in the report's auto.skipped."""
+    log("chaos_agent", f"auto: skipped weakness #{wek['rank']} ({wek['fault']} {wek['dependency']}): {rej}")
+    return {"rank": wek["rank"], "where": f"{wek['file']}:{wek['line']}",
+            "experiment": f"{wek['fault']} {wek['dependency']}", "why": f"rejected by the safety guard: {rej}"}
+
+
+def _plan_one(wek, num, dep, exp):
+    """Guard first (a rejected weakness costs no LLM call), then the LLM; exp is the rule-based fallback.
+    -> (exp, meta, rejection or None)."""
+    rej = guard.approve(exp, dep, mock=not ports.live())
+    if rej:
+        return exp, {"source": "fallback", "why": "rejected by the safety guard"}, rej
+    dat = {"weakness": {key: wek[key] for key in ("service", "dependency", "fault", "params", "file", "line", "code",
+                                                   "weakness", "hypothesis")},
+           "services": services(dep), "faults": {fal: sorted(prm) for fal, prm in FAULTS.items()},
+           "max_duration_s": MAX_DUR}
+    out, met = _ask("chaos_agent", CHAOS_AUTO_SYS, "Plan the experiment for this weakness. Data:", dat, CHAOS_SCHEMA,
+                    lambda raw: check_auto(raw, wek, num, dep))
+    return (out or exp), met, None
+
+
+def plan_pick(wek, num, dep):
+    """--auto --all: an experiment for campaign weakness wek (#rank of num), no fallback to another weakness.
+    -> (exp, meta, skipped or None); exp carries "rejection" if the guard rejected it."""
+    exp, met, rej = _plan_one(wek, num, dep, auto_fallback(wek, num, why=_campaign_why(wek)))
+    if rej:
+        return {**exp, "rejection": f"autonomous campaign: weakness #{wek['rank']} rejected by the safety guard: {rej}"}, \
+            met, skipped(wek, rej)
+    return exp, met, None
 
 
 # ---- 2. diagnosis agent (blind) ----
