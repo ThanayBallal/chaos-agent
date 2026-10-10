@@ -243,6 +243,7 @@ class RunnerSafety(unittest.TestCase):
         self.assertTrue(res["aborted"])
         obs = {o.split(":")[0]: o for o in res["observations"]}
         self.assertNotIn("no outcome", obs["cart_add"])
+        self.assertNotIn("no errors", obs["cart_add"])  # failures exist, even if they arrived after the abort
         self.assertIn("timed out", obs["cart_add"])
         self.assertGreater(res["error_rate"], 0.2)
 
