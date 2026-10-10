@@ -1,7 +1,9 @@
-"""P4: rank experiments. LLM plan via llm.ask_json, validated against the safety allowlist; deterministic fallback."""
+"""P4: rank experiments. 1) code review: the LLM reads robot-shop source and targets verified weaknesses,
+2) LLM plan from the dependency map, 3) deterministic centrality fallback. All validated by the safety guard."""
 import json
+import os
 
-from agent import llm
+from agent import code_review, llm
 from safety import guard
 from safety.allowlist import FAULTS, MAX_DUR, P95_MAX
 
@@ -122,8 +124,33 @@ def prompt(dep, bas, top):
     return f"Plan at most {top} experiments. Return {{\"experiments\": [...]}}.\n\n{json.dumps(dat, indent=1)}"
 
 
+def _fill(pln, dep, top):
+    """Top up a code-driven plan with centrality picks on other targets, renumbering ids and ranks."""
+    see = {exp["target"] for exp in pln}
+    for exp in fallback(dep, len(dep["services"])):
+        if len(pln) >= top:
+            break
+        if exp["target"] not in see:
+            see.add(exp["target"])
+            pln.append(exp)
+    for idx, exp in enumerate(pln, 1):
+        exp.update(id=f"e{idx}", rank=idx)  # code items are already e1..eN, only the top-ups move
+    return pln
+
+
 def plan(dep, bas, top=3):
-    """Return a plan.json-shaped list: LLM first, validated, else deterministic fallback."""
+    """Return a plan.json-shaped list: code-review plan first, else LLM graph plan, else deterministic fallback."""
+    if not os.environ.get("CHAOS_NO_CODE"):
+        try:
+            pln = code_review.to_plan(code_review.review(dep), dep, bas, centrality(dep), top)
+            if pln:
+                print(f"[planner] code-driven plan: {len(pln)} experiments from source-code weaknesses")
+                for exp in pln:
+                    for rsk in code_review.risks_for(exp["id"])[:2]:
+                        print(f"   {exp['id']} {exp['fault']} {exp['target']} <- {rsk['file']}:{rsk['line']}  {rsk['quote'][:70]}")
+                return _fill(pln, dep, top)
+        except Exception as err:
+            print(f"[planner] code review skipped ({str(err)[:160]})")
     try:
         pln = llm.ask_json(SYS, prompt(dep, bas, top), schema=schema(dep),
                            check=lambda raw: validate(raw, dep, bas, top))

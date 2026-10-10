@@ -2,7 +2,7 @@
 import json
 import re
 
-from agent import llm
+from agent import code_review, llm
 
 SEV = [(0.5, "critical"), (0.2, "high"), (0.05, "medium"), (0.0, "low")]
 ORD = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -18,7 +18,7 @@ For every experiment return:
 - weakness: one or two sentences explaining what the measurements show broke and why, using the dependency map to name the affected services.
 - hypothesis: "matched" if the observations and metrics confirm the hypothesis, "not_matched" if they contradict it, "inconclusive" if the data cannot decide or there is no hypothesis.
 - severity: critical | high | medium | low, judged by user impact in the measured data.
-- fix: concrete, actionable changes naming the service and file to change, chosen from: compose restart policy (restart: always / unless-stopped), a compose healthcheck plus depends_on condition: service_healthy, client retries with exponential backoff, connection/request timeouts, replicas or a graceful fallback. Each fix must cite the measured evidence that motivates it (quote at least one measured error_rate, p95_ms or recovery_s value).
+- fix: concrete, actionable changes naming the service and file to change (when code_weaknesses are given, fix those exact file:line locations), chosen from: compose restart policy (restart: always / unless-stopped), a compose healthcheck plus depends_on condition: service_healthy, client retries with exponential backoff, connection/request timeouts, replicas or a graceful fallback. Each fix must cite the measured evidence that motivates it (quote at least one measured error_rate, p95_ms or recovery_s value).
 
 Hard rule: every number you write must be copied verbatim from the provided data. Never invent metrics, thresholds, counts, durations or percentages. If a config value would need a number that is not in the data, describe it without a number."""
 
@@ -47,6 +47,12 @@ def finish(fnd, rsl):
     return {"resilience_score": scr, "findings": [{"rank": itm.pop("rank"), **itm} for itm in fnd]}
 
 
+def _code_fix(res):
+    """Fix text from the source-code weaknesses that motivated this experiment, citing file:line."""
+    rsk = code_review.risks_for(res["id"])
+    return "; ".join(f"{itm['file']}:{itm['line']}: {itm['fix']}" for itm in rsk[:2]) if rsk else ""
+
+
 def fallback(dep, bas, rsl, pln=None):
     """Rule-based findings from the measured numbers only."""
     fnd = []
@@ -55,8 +61,8 @@ def fallback(dep, bas, rsl, pln=None):
                     "weakness": f"{res['fault']} on {res['target']} raised errors to {res['error_rate']:.0%}",
                     "evidence": evidence(res, bas),
                     "hypothesis_matched": None,
-                    "fix": f"add restart policy and healthcheck for {res['target']}; "
-                           f"retries with backoff and timeouts in its dependents"})
+                    "fix": _code_fix(res) or f"add restart policy and healthcheck for {res['target']}; "
+                                             f"retries with backoff and timeouts in its dependents"})
     return finish(fnd, rsl)
 
 
@@ -66,7 +72,7 @@ def _norm(val):
 
 def allowed(res, bas, exp):
     """Every number present in this experiment's data, plus percent forms of fractions."""
-    src = json.dumps([res, bas, exp or {}])
+    src = json.dumps([res, bas, exp or {}, code_review.risks_for(res.get("id"))])
     out = {_norm(tok) for tok in re.findall(r"\d+(?:\.\d+)?", src)}
     for tok in list(out):
         if float(tok) <= 1:
@@ -134,7 +140,9 @@ def prompt(dep, bas, rsl, pex):
     dat = {"baseline": pub(bas),
            "dependency_map": {"services": [{key: svc.get(key) for key in ("name", "kind", "depends_on")}
                                            for svc in dep["services"]], "edges": dep["edges"]},
-           "experiments": [{"plan": pex.get(res["id"]), "result": res} for res in rsl]}
+           "experiments": [{"plan": pex.get(res["id"]), "result": res,
+                            "code_weaknesses": [{key: rsk[key] for key in ("file", "line", "quote", "weakness", "fix")}
+                                                for rsk in code_review.risks_for(res["id"])]} for res in rsl]}
     return f"Analyze every experiment. Return {{\"findings\": [...]}}.\n\n{json.dumps(dat, indent=1)}"
 
 

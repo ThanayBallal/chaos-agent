@@ -87,7 +87,7 @@ def _bounded(fnc, tmo, *arg):
     thr.start()
     thr.join(tmo)
     if thr.is_alive():
-        raise TimeoutError(f"LLM call exceeded the {CAP:g}s cap")
+        raise TimeoutError(f"LLM call exceeded the {tmo:g}s cap")
     if "err" in box:
         raise box["err"]
     return box["ok"]
@@ -118,12 +118,13 @@ def _strip(txt):
     return txt
 
 
-def ask_json(sys_prompt, usr_prompt, tries=3, schema=None, check=None):
+def ask_json(sys_prompt, usr_prompt, tries=3, schema=None, check=None, cap=None):
     """Return parsed JSON from the LLM; retry on invalid JSON; raise after tries.
 
     schema: JSON Schema (object root); enforced by anthropic structured outputs, appended to the prompt otherwise.
     check:  fn(obj) -> cleaned obj; raising ValueError retries with the error fed back to the model.
-    Config, import, API, refusal and timeout (CAP seconds across all tries) errors are raised so callers can fall back.
+    cap:    overall seconds for this call across retries (default CAP).
+    Config, import, API, refusal and timeout errors are raised so callers can fall back.
     """
     pvd, key, mdl = config()
     try:
@@ -132,11 +133,12 @@ def ask_json(sys_prompt, usr_prompt, tries=3, schema=None, check=None):
         raise RuntimeError(f"LLM_PROVIDER={pvd} needs `pip install {PKG[pvd]}` ({err})") from err
     if schema and pvd != "anthropic":
         sys_prompt = f"{sys_prompt}\n\nReply with a single JSON object matching this JSON Schema:\n{json.dumps(schema)}"
-    msg, err, end = usr_prompt, None, time.monotonic() + CAP
+    lim = cap or CAP
+    msg, err, end = usr_prompt, None, time.monotonic() + lim
     for _ in range(tries):
         rem = end - time.monotonic()
         if rem < 1:
-            raise TimeoutError(f"LLM gave no valid JSON within the {CAP:g}s cap: {err}")
+            raise TimeoutError(f"LLM gave no valid JSON within the {lim:g}s cap: {err}")
         txt = _bounded(CALL[pvd], rem, key, mdl, sys_prompt, msg, schema)
         try:
             obj = json.loads(_strip(txt))
