@@ -1,0 +1,38 @@
+{
+  "app": "robot-shop",
+  "_note": "MOCK - hand-written guess, P2 replaces with data/depmap.json generated from compose",
+  "services": [
+    {"name": "web", "kind": "proxy", "depends_on": ["catalogue", "user", "cart", "shipping", "payment", "ratings"], "evidence": ["mock"]},
+    {"name": "catalogue", "kind": "app", "depends_on": ["mongodb"], "evidence": ["mock"]},
+    {"name": "user", "kind": "app", "depends_on": ["mongodb", "redis"], "evidence": ["mock"]},
+    {"name": "cart", "kind": "app", "depends_on": ["redis", "catalogue"], "evidence": ["mock"]},
+    {"name": "shipping", "kind": "app", "depends_on": ["mysql", "cart"], "evidence": ["mock"]},
+    {"name": "ratings", "kind": "app", "depends_on": ["mysql"], "evidence": ["mock"]},
+    {"name": "payment", "kind": "app", "depends_on": ["rabbitmq", "cart", "user"], "evidence": ["mock"]},
+    {"name": "dispatch", "kind": "app", "depends_on": ["rabbitmq"], "evidence": ["mock"]},
+    {"name": "mongodb", "kind": "db", "depends_on": [], "evidence": ["mock"]},
+    {"name": "mysql", "kind": "db", "depends_on": [], "evidence": ["mock"]},
+    {"name": "redis", "kind": "cache", "depends_on": [], "evidence": ["mock"]},
+    {"name": "rabbitmq", "kind": "queue", "depends_on": [], "evidence": ["mock"]}
+  ],
+  "edges": [
+    {"src": "web", "dst": "catalogue", "type": "http", "evidence": "mock"},
+    {"src": "web", "dst": "user", "type": "http", "evidence": "mock"},
+    {"src": "web", "dst": "cart", "type": "http", "evidence": "mock"},
+    {"src": "web", "dst": "shipping", "type": "http", "evidence": "mock"},
+    {"src": "web", "dst": "payment", "type": "http", "evidence": "mock"},
+    {"src": "web", "dst": "ratings", "type": "http", "evidence": "mock"},
+    {"src": "catalogue", "dst": "mongodb", "type": "db", "evidence": "mock"},
+    {"src": "user", "dst": "mongodb", "type": "db", "evidence": "mock"},
+    {"src": "user", "dst": "redis", "type": "cache", "evidence": "mock"},
+    {"src": "cart", "dst": "redis", "type": "cache", "evidence": "mock"},
+    {"src": "cart", "dst": "catalogue", "type": "http", "evidence": "mock"},
+    {"src": "shipping", "dst": "mysql", "type": "db", "evidence": "mock"},
+    {"src": "shipping", "dst": "cart", "type": "http", "evidence": "mock"},
+    {"src": "ratings", "dst": "mysql", "type": "db", "evidence": "mock"},
+    {"src": "payment", "dst": "rabbitmq", "type": "queue", "evidence": "mock"},
+    {"src": "payment", "dst": "cart", "type": "http", "evidence": "mock"},
+    {"src": "payment", "dst": "user", "type": "http", "evidence": "mock"},
+    {"src": "dispatch", "dst": "rabbitmq", "type": "queue", "evidence": "mock"}
+  ]
+}

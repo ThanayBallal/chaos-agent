@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+STOP
+robot-shop/
+data/depmap.json
+data/baseline.json
+data/plan.json
+data/results/
+data/findings.json

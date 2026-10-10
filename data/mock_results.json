@@ -1,0 +1,11 @@
+[
+  {"id": "e1", "target": "redis", "fault": "kill", "started_at": "MOCK", "ended_at": "MOCK",
+   "error_rate": 0.62, "p95_ms": 2400, "recovery_s": 14, "aborted": false, "abort_reason": null,
+   "observations": ["MOCK: cart 500s from t=3s", "MOCK: catalogue unaffected"]},
+  {"id": "e2", "target": "mongodb", "fault": "pause", "started_at": "MOCK", "ended_at": "MOCK",
+   "error_rate": 0.55, "p95_ms": 5200, "recovery_s": 22, "aborted": true, "abort_reason": "p95 > 5000 ms",
+   "observations": ["MOCK: catalogue and login time out"]},
+  {"id": "e3", "target": "rabbitmq", "fault": "kill", "started_at": "MOCK", "ended_at": "MOCK",
+   "error_rate": 0.03, "p95_ms": 260, "recovery_s": 9, "aborted": false, "abort_reason": null,
+   "observations": ["MOCK: checkout succeeds, dispatch receives nothing"]}
+]

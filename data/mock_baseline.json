@@ -1,0 +1,5 @@
+{"window_s": 120, "requests": 2400, "error_rate": 0.004, "p50_ms": 45, "p95_ms": 180,
+ "health": {"web": "healthy", "catalogue": "healthy", "user": "healthy", "cart": "healthy",
+            "shipping": "healthy", "ratings": "healthy", "payment": "healthy", "dispatch": "healthy",
+            "mongodb": "healthy", "mysql": "healthy", "redis": "healthy", "rabbitmq": "healthy"},
+ "captured_at": "MOCK", "_note": "MOCK numbers - P3 replaces with data/baseline.json"}
