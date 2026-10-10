@@ -57,6 +57,10 @@ def result(eid, tgt, fal, err=0.02, **kw):
             "p95_ms": 200, "recovery_s": 5, "aborted": False, "abort_reason": None, "observations": [], **kw}
 
 
+for _rsk in (RISK_STATE, RISK_FLAG, RISK_TMO):
+    _rsk.update(params=dict(planner.PRM[_rsk["fault"]]), hypothesis=f"{_rsk['service']} degrades")
+
+
 class Isolated(unittest.TestCase):
     """No LLM, no writes into data/, a clean code-review risk table."""
 
@@ -151,6 +155,23 @@ class Patcher(Isolated):
         self.assertEqual([(itm["file"], itm["line"], itm["suggestion"]) for itm in pch["code_suggestions"]],
                          [("catalogue/server.js", 173, "LLM: reset mongoConnected on close")])
 
+    def test_results_are_used_directly_when_given(self):
+        pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "kill")]
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("recovery 4s")),  # evidence says nothing about loss
+               dict(finding(2, "e2", "mongodb"), evidence=evd("recovery 4s"))]  # evidence says fast recovery
+        rsl = [result("e1", "redis", "kill", data_survived=False, recovery_s=4),
+               result("e2", "mongodb", "kill", data_survived=None, recovery_s=None)]
+        pch = patcher.make({"findings": fnd}, pln, DEP, rsl)
+        self.assertEqual([(itm["fix"], itm["service"]) for itm in pch["patches"]],
+                         [("redis_aof", "redis"), ("restart_policy", "mongodb")])
+        self.assertEqual(patcher.make({"findings": fnd}, pln, DEP)["patches"], [])  # evidence-only: nothing to fix
+
+    def test_measured_survival_overrides_code_weakness(self):
+        code_review.LAST["e1"] = [RISK_STATE]
+        fnd = [dict(finding(1, "e1", "redis"), evidence=evd("recovery 4s"))]
+        rsl = [result("e1", "redis", "kill", data_survived=True, recovery_s=4)]
+        self.assertEqual(patcher.make({"findings": fnd}, [exp("e1", "redis", "kill")], DEP, rsl)["patches"], [])
+
     def test_every_patch_uses_the_fix_allowlist_and_depmap_services(self):
         code_review.LAST.update(e1=[RISK_STATE], e2=[RISK_FLAG])
         fnd = [dict(finding(1, "e1", "redis"), evidence=evd("no recovery measured", True)),
@@ -172,34 +193,63 @@ class Planner(Isolated):
         self.assertEqual({exp["fault"] for exp in pln}, set(planner.CORE))
         self.assertEqual([(exp["id"], exp["rank"]) for exp in pln], [("e1", 1), ("e2", 2), ("e3", 3)])
 
-    def test_latency_only_after_core_faults(self):
-        pln = [exp("e1", "mongodb", "latency"), exp("e2", "redis", "kill"), exp("e3", "rabbitmq", "pause")]
+    def test_top_ranked_experiment_is_never_changed(self):
+        pln = [exp("e1", "mongodb", "latency"), exp("e2", "redis", "kill"), exp("e3", "catalogue", "kill")]
         out = planner.diversify(pln, DEP, BAS, 3)
-        self.assertEqual({exp["fault"] for exp in out}, set(planner.CORE))
-        out = planner.diversify([exp("e1", "mongodb", "latency"), exp("e2", "redis", "kill"),
-                                 exp("e3", "rabbitmq", "pause")], DEP, BAS, 4)
-        self.assertEqual([exp["fault"] for exp in out][3], "latency")
-        self.assertEqual({exp["fault"] for exp in out[:3]}, set(planner.CORE))
+        self.assertEqual((out[0]["target"], out[0]["fault"]), ("mongodb", "latency"))
+        self.assertEqual((out[1]["target"], out[1]["fault"]), ("redis", "kill"))
+        self.assertEqual(out[2]["fault"], "pause")  # the lower-ranked duplicate kill was diversified
+        self.assertEqual(len({exp["fault"] for exp in out}), 3)
 
-    def test_extra_target_is_new_healthy_and_fits_the_fault(self):
-        pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "pause"), exp("e3", "rabbitmq", "kill")]
-        out = planner.diversify(pln, DEP, dict(BAS, health=dict(BAS["health"], catalogue="unhealthy")), 3)
+    def test_redis_state_loss_kill_is_protected_even_when_ranked_low(self):
+        pln = [exp("e1", "mongodb", "pause"), exp("e2", "catalogue", "kill"), exp("e3", "redis", "kill")]
+        code_review.LAST["e3"] = [RISK_STATE]
+        out = planner.diversify(pln, DEP, BAS, 3)
+        self.assertIn(("redis", "kill"), [(exp["target"], exp["fault"]) for exp in out])
+        self.assertNotIn(("catalogue", "kill"), [(exp["target"], exp["fault"]) for exp in out])
         new = out[-1]
         self.assertEqual(new["fault"], "cpu_stress")
-        self.assertEqual(new["target"], "user")  # highest-centrality healthy app not already planned (web, payment)
-        self.assertEqual([exp["target"] for exp in out[:2]], ["redis", "mongodb"])  # code picks keep their rank
+        self.assertEqual(new["target"], "catalogue")  # app service with the highest centrality not left in the plan
+        self.assertEqual(code_review.risks_for(next(exp["id"] for exp in out if exp["target"] == "redis")), [RISK_STATE])
+
+    def test_pause_goes_on_a_db_and_cpu_stress_on_an_app(self):
+        dep = dict(DEP, services=DEP["services"] + [{"name": "mysql", "kind": "db", "depends_on": []}])
+        bas = dict(BAS, health=dict(BAS["health"], mysql="healthy"))
+        pln = [exp("e1", "redis", "kill"), exp("e2", "rabbitmq", "kill"), exp("e3", "catalogue", "kill")]
+        out = planner.diversify(pln, dep, bas, 3)
+        knd = {svc["name"]: svc["kind"] for svc in dep["services"]}
+        got = {exp["fault"]: knd[exp["target"]] for exp in out[1:]}
+        self.assertEqual(got, {"pause": "db", "cpu_stress": "app"})
+
+    def test_latency_moves_after_core_faults_unless_top(self):
+        pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "latency"), exp("e3", "rabbitmq", "pause")]
+        out = planner.diversify(pln, DEP, BAS, 4)
+        self.assertEqual([exp["fault"] for exp in out], ["kill", "pause", "latency"])
 
     def test_code_risks_follow_renumbered_experiments(self):
-        pln = [exp("e1", "mongodb", "latency"), exp("e2", "redis", "kill"), exp("e3", "rabbitmq", "pause")]
-        code_review.LAST.update(e2=[RISK_STATE], e3=[RISK_TMO])
+        pln = [exp("e1", "redis", "kill"), exp("e2", "rabbitmq", "kill"), exp("e3", "mongodb", "latency")]
+        code_review.LAST.update(e1=[RISK_STATE], e2=[RISK_TMO])
         out = planner.diversify(pln, DEP, BAS, 3)
         byt = {exp["target"]: exp["id"] for exp in out}
         self.assertEqual(code_review.risks_for(byt["redis"]), [RISK_STATE])
-        self.assertEqual(code_review.risks_for(byt["rabbitmq"]), [RISK_TMO])
+        if "rabbitmq" in byt:
+            self.assertEqual(code_review.risks_for(byt["rabbitmq"]), [RISK_TMO])
 
     def test_small_plans_are_left_alone(self):
         pln = [exp("e1", "redis", "kill"), exp("e2", "mongodb", "kill")]
         self.assertEqual([exp["fault"] for exp in planner.diversify(pln, DEP, BAS, 2)], ["kill", "kill"])
+
+    def test_code_review_keeps_redis_state_loss_as_kill(self):
+        tmo = dict(RISK_STATE, fault="pause", weakness="redis calls have no timeout", fix="add timeouts", weight=5)
+        sta = dict(RISK_STATE, fault="pause")  # even if mislabelled pause, a state weakness is tested by a kill
+        pln = code_review.to_plan({"risks": [tmo, sta]}, DEP, BAS, planner.centrality(DEP), 3)
+        self.assertEqual([(exp["target"], exp["fault"]) for exp in pln], [("redis", "kill")])
+
+    def test_code_review_ties_go_to_kill(self):
+        pau = dict(RISK_TMO, dependency="redis", fault="pause", weight=3)
+        kil = dict(RISK_FLAG, dependency="redis", fault="kill", weight=3)
+        pln = code_review.to_plan({"risks": [pau, kil]}, DEP, BAS, planner.centrality(DEP), 3)
+        self.assertEqual(pln[0]["fault"], "kill")
 
 
 class DataLoss(Isolated):
@@ -209,7 +259,14 @@ class DataLoss(Isolated):
         self.assertEqual(itm["severity"], "high")
         self.assertRegex(itm["weakness"].lower(), "data loss")
         self.assertIn("data_survived false", itm["evidence"])
-        self.assertTrue(patcher.OUT.exists())
+        self.assertFalse(patcher.OUT.exists())  # the analyst never writes patch.json
+
+    def test_analyst_makes_one_llm_call_only(self):
+        res = result("e1", "redis", "kill", err=0.01, data_survived=False)
+        cal = []
+        with mock.patch.object(analyst.llm, "ask_json", lambda *a, **kw: cal.append(1) or 1 / 0):
+            analyst.analyze(DEP, BAS, [res], [exp("e1", "redis", "kill")])
+        self.assertEqual(len(cal), 1)
 
     def test_llm_cannot_downgrade_data_loss(self):
         res = result("e1", "redis", "kill", err=0.01, data_survived=False)

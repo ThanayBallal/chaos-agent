@@ -8,10 +8,11 @@
 Rules decide which patches exist:
 - redis data/state loss (data_survived false, a "data loss" finding, or a state-loss code weakness on redis) -> redis_aof on redis
 - a killed dependency with slow (> SLOW_S) or no recovery -> restart_policy on that service
+data_survived and recovery_s come from the results (rsl) when given, else from the findings' evidence text.
 Everything else (stale health flags, missing timeouts, publish-before-commit, ...) -> code_suggestions citing a
 code-review file:line. The LLM, when available, only words reason/expected/suggestions; anything that is not an
 eligible patch (fix not in FIXES, service not in depmap, rule not met) or not a cited file:line is dropped.
-Run standalone: python -m agent.patcher
+Run standalone: python -m agent.patcher [--mock]
 """
 import json
 import re
@@ -66,29 +67,35 @@ def _redis(dep):
     return "redis" if "redis" in nam else next((itm for itm in nam if "redis" in itm), None)
 
 
-def recovery(itm):
-    """(recovered, seconds) from the analyst's evidence string; seconds is None when not measured."""
+def measured(itm, res):
+    """(data_lost, recovered, recovery seconds) for one finding: from its result when given, else its evidence text.
+    data_lost is True / False / None (not probed)."""
+    if res is not None:
+        sec, srv = res.get("recovery_s"), res.get("data_survived")
+        return None if srv is None else not srv, sec is not None, sec
     evi = itm.get("evidence", "")
     hit = REC.search(evi)
-    return (False, None) if "no recovery" in evi else (True, float(hit.group(1)) if hit else None)
+    lost = True if LOSS.search(f"{itm.get('weakness', '')} {evi}") else None
+    return lost, "no recovery" not in evi, float(hit.group(1)) if hit and "no recovery" not in evi else None
 
 
-def eligible(fnd, pln, dep):
+def eligible(fnd, pln, dep, rsl=None):
     """Rule-based patches {(fix, service, experiment): template patch}, plus the cited (file, line) pairs."""
+    rby = {res["id"]: res for res in rsl} if rsl is not None else {}
     red, nam = _redis(dep), {svc["name"] for svc in dep["services"]}
     out, cit = {}, {}
     for itm, exp, rsk in _context(fnd, pln):
         for rkx in rsk:
             cit[(rkx["file"], rkx["line"])] = rkx
         tgt, eid = itm["target"], itm["experiment"]
+        lost, ok, sec = measured(itm, rby.get(eid) if rsl is not None else None)
         sta = [rkx for rkx in rsk if rkx.get("dependency") == red and STATE.search(rkx.get("weakness", ""))]
-        if red and (sta or (tgt == red and LOSS.search(f"{itm['weakness']} {itm['evidence']}"))):
+        if red and lost is not False and (sta or (tgt == red and lost)):  # a measured survival wins
             why = f"{sta[0]['file']}:{sta[0]['line']} {sta[0]['weakness']}" if sta else itm["weakness"]
             out.setdefault(("redis_aof", red, eid), {
                 "experiment": eid, "service": red, "fix": "redis_aof",
                 "reason": f"{why}; measured: {itm['evidence']}",
                 "expected": f"data written to {red} survives a {red} crash (data_survived true on the re-run)"})
-        ok, sec = recovery(itm)
         if exp.get("fault") == "kill" and tgt in nam and (not ok or (sec is not None and sec > SLOW_S)):
             out.setdefault(("restart_policy", tgt, eid), {
                 "experiment": eid, "service": tgt, "fix": "restart_policy",
@@ -156,9 +163,10 @@ def prompt(fnd, pln, elg):
     return f"Return {{\"patches\": [...], \"code_suggestions\": [...]}}.\n\n{json.dumps(dat, indent=1)}"
 
 
-def make(fnd, pln, dep, save=True):
-    """Return patch.json for these findings and write it to data/patch.json."""
-    elg, cit = eligible(fnd, pln, dep)
+def make(fnd, pln, dep, rsl=None, save=True):
+    """Return patch.json for these findings and write it to data/patch.json.
+    rsl: the result.json list behind fnd; when given, data_survived and recovery_s are read from it directly."""
+    elg, cit = eligible(fnd, pln, dep, rsl)
     pat, sug, src = {}, [], "template"
     if fnd.get("findings") and (elg or cit):
         try:
@@ -182,9 +190,21 @@ def make(fnd, pln, dep, save=True):
     return pch
 
 
-if __name__ == "__main__":
+def _cli():
+    """python -m agent.patcher [--mock]: patch the last run's data/findings.json + data/plan.json.
+    --mock rebuilds the results like main.py --mock does (mock_results.json matched by target)."""
+    import sys
     dat = ROT / "data"
-    dep_ = dat / "depmap.json" if (dat / "depmap.json").exists() else dat / "mock_depmap.json"
-    make(json.loads((dat / "findings.json").read_text()), json.loads((dat / "plan.json").read_text()),
-         json.loads(dep_.read_text()))
+    rd = lambda nam: json.loads((dat / nam).read_text())
+    pln = rd("plan.json")
+    if "--mock" in sys.argv:
+        dep, mck = rd("mock_depmap.json"), {res["target"]: res for res in rd("mock_results.json")}
+        rsl = [{**mck[exp["target"]], "id": exp["id"], "fault": exp["fault"]} for exp in pln if exp["target"] in mck]
+    else:
+        dep, rsl = rd("depmap.json" if (dat / "depmap.json").exists() else "mock_depmap.json"), None
+    make(rd("findings.json"), pln, dep, rsl)
     print(f"[patcher] wrote {OUT}")
+
+
+if __name__ == "__main__":
+    _cli()

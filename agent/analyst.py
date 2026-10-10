@@ -2,7 +2,7 @@
 import json
 import re
 
-from agent import code_review, llm, patcher
+from agent import code_review, llm
 
 SEV = [(0.5, "critical"), (0.2, "high"), (0.05, "medium"), (0.0, "low")]
 ORD = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -162,18 +162,6 @@ def prompt(dep, bas, rsl, pex):
 
 
 def analyze(dep, bas, rsl, pln=None):
-    """Return a dict matching contracts.md findings.json (LLM first, else rule-based fallback).
-    Also writes data/patch.json from the findings via patcher.make (never fails the analysis)."""
-    fnd = _analyze(dep, bas, rsl, pln)
-    if fnd["findings"]:
-        try:
-            patcher.make(fnd, pln, dep)
-        except Exception as err:
-            print(f"[analyst] patch step failed ({str(err)[:160]})")
-    return fnd
-
-
-def _analyze(dep, bas, rsl, pln=None):
     if not rsl:
         return fallback(dep, bas, rsl, pln)
     pex = {exp["id"]: exp for exp in pln or []}

@@ -307,15 +307,29 @@ def review(dep):
     return rev
 
 
+STATE = re.compile(r"data[- ]loss|lost data|\bstate\b|persisten|no volume|only copy", re.I)
+
+
+def state_loss(rsk):
+    """True when a risk is about stored data/state that would be lost if the dependency restarts."""
+    return bool(STATE.search(f"{rsk.get('weakness', '')} {rsk.get('fix', '')}"))
+
+
 def to_plan(rev, dep, bas, cen, top=3):
     """Group verified risks by (dependency, fault) into plan.json items, ranked by weight x centrality."""
     hea = bas.get("health", {})
-    grp = {}
+    grp, sta = {}, set()
     for rsk in rev.get("risks", []):
         if hea.get(rsk["dependency"], "healthy") != "healthy":
             continue
+        if state_loss(rsk):  # data/state loss only shows when the store is killed and restarted
+            sta.add(rsk["dependency"])
+            if rsk["fault"] != "kill":
+                rsk = dict(rsk, fault="kill", params=_params("kill"))
         grp.setdefault((rsk["dependency"], rsk["fault"]), []).append(rsk)
-    rnk = sorted(grp.items(), key=lambda kv: -sum(rsk["weight"] for rsk in kv[1]) * (1 + cen.get(kv[0][0], 0)))
+    grp = {key: val for key, val in grp.items() if key[0] not in sta or key[1] == "kill"}
+    rnk = sorted(grp.items(), key=lambda kv: (-sum(rsk["weight"] for rsk in kv[1]) * (1 + cen.get(kv[0][0], 0)),
+                                              kv[0][1] != "kill"))  # ties go to kill, the most telling fault
     pln, see = [], set()
     LAST.clear()
     for (dpn, fal), rsk in rnk:

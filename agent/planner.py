@@ -12,7 +12,8 @@ DEF = {"db": "pause", "cache": "kill", "queue": "kill", "proxy": "latency", "app
 PRM = {"kill": {"duration_s": 30}, "pause": {"duration_s": 30},
        "latency": {"duration_s": 30, "delay_ms": 500}, "cpu_stress": {"duration_s": 30, "cpus": 1}}
 RSK = ["high", "medium", "low"]
-CORE = ("kill", "pause", "cpu_stress")  # with top >= 3 every plan covers these; latency only as 4th+
+CORE = ("kill", "pause", "cpu_stress")  # latency goes after these unless it is the protected top experiment
+ADD = ("pause", "cpu_stress", "kill")  # order diversify fills missing types in: pause on a db, cpu_stress on an app
 FIT = {"kill": ["cache", "queue", "app"], "pause": ["db", "cache", "queue", "app"],
        "cpu_stress": ["app", "proxy"], "latency": ["db", "cache", "app"]}
 HYP = {"kill": "requests that need {nam} fail while it is down and recover after it restarts",
@@ -165,19 +166,29 @@ def _extra(fal, pln, dep, bas):
     return None
 
 
+def _keep(exp, top_id):
+    """The top-ranked experiment and any kill covering a data/state-loss weakness keep their fault and slot."""
+    return exp["id"] == top_id or exp["fault"] == "kill" and any(map(code_review.state_loss,
+                                                                    code_review.risks_for(exp["id"])))
+
+
 def diversify(pln, dep, bas, top=3):
-    """When top >= 3, make sure kill, pause and cpu_stress all appear; latency only after them (4th or later)."""
-    if top < 3:
+    """When top >= 3, make the plan cover at least 3 different fault types by replacing lower-ranked duplicates
+    (or appending): pause on a db and cpu_stress on an app first. The top-ranked experiment and data-loss kills
+    are never changed; latency is moved after the core faults unless it is the protected top experiment."""
+    if top < 3 or not pln:
         return pln
     own = [(exp, code_review.risks_for(exp["id"])) for exp in pln]  # keeps code risks attached through renumbering
+    fix = [exp for exp in pln if _keep(exp, pln[0]["id"])]
     pln = list(pln)
-    for fal in CORE:
-        if any(exp["fault"] == fal for exp in pln):
+    for fal in ADD:
+        if len({exp["fault"] for exp in pln}) >= 3 or any(exp["fault"] == fal for exp in pln):
             continue
         vic = None
         if len(pln) >= top:
             cnt = Counter(exp["fault"] for exp in pln)
-            vic = next((exp for exp in reversed(pln) if exp["fault"] not in CORE or cnt[exp["fault"]] > 1), None)
+            vic = next((exp for exp in reversed(pln) if not any(exp is one for one in fix)
+                        and (exp["fault"] not in CORE or cnt[exp["fault"]] > 1)), None)
             if vic is None:
                 continue
         new = _extra(fal, [exp for exp in pln if exp is not vic], dep, bas)
@@ -186,8 +197,8 @@ def diversify(pln, dep, bas, top=3):
         if vic is not None:
             pln.remove(vic)
         pln.append(new)  # diversity picks rank after the code/LLM-chosen experiments
-        print(f"[planner] added {fal} on {new['target']} so the plan covers {len(CORE)} fault types")
-    pln.sort(key=lambda exp: exp["fault"] not in CORE)  # stable: latency goes after the core faults
+        print(f"[planner] added {fal} on {new['target']} so the plan covers 3 fault types")
+    pln[1:] = sorted(pln[1:], key=lambda exp: exp["fault"] not in CORE)  # stable; the top experiment stays first
     code_review.LAST.clear()
     for idx, exp in enumerate(pln, 1):
         exp.update(id=f"e{idx}", rank=idx)
@@ -199,7 +210,7 @@ def diversify(pln, dep, bas, top=3):
 
 def plan(dep, bas, top=3):
     """Return a plan.json-shaped list: code-review plan first, else LLM graph plan, else deterministic fallback.
-    With top >= 3 the plan always covers kill, pause and cpu_stress (see diversify)."""
+    With top >= 3 the plan always has at least 3 different fault types (see diversify)."""
     if not os.environ.get("CHAOS_NO_CODE"):
         try:
             pln = code_review.to_plan(code_review.review(dep), dep, bas, centrality(dep), top)
