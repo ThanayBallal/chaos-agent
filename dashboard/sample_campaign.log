@@ -1,0 +1,183 @@
+PASS: all Robot Shop containers are running.
+[heal] understand: capturing 30s baseline under load...
+[code-review] reusing cached LLM review of 28 files (3 risks)
+[code-review] + 1 state-loss weakness(es) from the static scan: cart/server.js:379
+[heal] understand: baseline error_rate=0.0 p95=59ms; code review source=llm risks=4
+== Code review (llm, 28 files): top 4 weaknesses
+ 1. catalogue -> mongodb (kill)  catalogue/server.js:68
+    code: if(mongoConnected) {
+    weakness: Catalogue health and request routing relies on a static mongoConnected flag that is never updated or reset if the database drops.
+ 2. user -> mongodb (pause)  user/server.js:86
+    code: if(mongoConnected) {
+    weakness: User service guards queries with a mongoConnected flag that is never dynamically updated or reset upon database failures.
+ 3. cart -> redis (latency)  cart/server.js:85
+    code: redisClient.get(req.params.id, (err, data) => {
+    weakness: Cart service queries Redis without a command timeout, causing requests to hang if Redis becomes unresponsive.
+ 4. cart -> redis (kill)  cart/server.js:379
+    code: redisClient.setex(id, 3600, JSON.stringify(cart), (err, data) => {
+    weakness: cart keeps its only copy of user state in redis, which has no volume or persistence in docker-compose.yaml
+== Mode: auto campaign: weaknesses #1..#4 of 4, one heal cycle each
+=== Cycle 1/4: mongodb kill ===
+[heal] understand: reusing the campaign's depmap, baseline and code review
+== Auto: weakness #1 of 4: kill mongodb
+[heal] chaos_agent: [llm] kill mongodb {'duration_s': 10}: Chosen autonomously: weakness #1 of 4 from the code review (catalogue/server.js:68) because the catalogue/server.js code uses a static mongoConnected flag that never updates when MongoDB drops.
+[heal] guard_approve: approved
+[heal] inject: kill on mongodb: crash: SIGKILL to main process (restart policy applies)
+[heal] hold: app is broken. Press Enter to start healing (auto-continues in 90 s)
+[heal] hold: 5s/90s (STOP file or Ctrl+C reverts) | cart=running catalogue=running dispatch=running mongodb=exited mysql=running payment=running rabbitmq=running ratings=running redis=running shipping=running user=running web=running
+[heal] hold: 10s/90s (STOP file or Ctrl+C reverts) | cart=running catalogue=running dispatch=running mongodb=exited mysql=running payment=running rabbitmq=running ratings=running redis=running shipping=running user=running web=running
+[heal] hold: enter after 21s, healing starts now (60s deadline)
+[heal.ports] observe: error_rate=0.322 p95=6022ms unhealthy=['mongodb']
+[heal] observe: attempt 0: error_rate=0.322 p95=6022ms
+[heal] diagnosis_agent: [llm] kill on mongodb: mongodb container is exited (containers_not_running); mongodb is marked unhealthy (unhealthy) (confidence 0.95, correct=True)
+[heal] remediation_agent: [llm] start_service(mongodb) -> restart_web(web)
+[heal.ports] heal_fix: start_service(mongodb) ok=True: started (was exited)
+[heal.ports] heal_fix: restart_web(web) ok=True: restarted
+[heal] apply_fix: attempt 1: start_service ok=True, restart_web ok=True
+[heal.ports] verify: steady after 38s (11 samples)
+[heal] verify: attempt 1: healed, recovery 38s
+[patcher] 1 live patches (restart_policy mongodb), 1 code suggestions (llm)
+[heal] harden_agent: round 1: restart_policy mongodb
+[heal.ports] apply: restart_policy mongodb
+[heal] apply_hardening: round 1: applied c1-p1
+[heal.ports] observe: error_rate=0.0 p95=2949ms unhealthy=none
+[heal.ports] verify: steady after 24s (10 samples)
+[heal.ports] revert_all: 2 injected fault(s) reverted
+[heal] rerun: round 1: error_rate=0.0 recovery=24s data_survived=True
+[heal] compare: round 1: improved=True (error_rate 0.322 -> 0.0; recovery 38s -> 24s)
+[heal] guard_revert: reverted fault e1 kill on mongodb
+[heal] report: outcome=healed hardening=improved_round1 attempts=1 rounds=1
+== Mode: auto campaign (weakness #1 of 4 from the code review)
+== Experiment: kill mongodb {"duration_s": 10}
+   reason: Chosen autonomously: weakness #1 of 4 from the code review (catalogue/server.js:68) because the catalogue/server.js code uses a static mongoConnected flag (see if(mongoConnected) {}) that never updates when MongoDB drops, which can cause the service to report healthy status while requests actually hang or fail silently.
+   hypothesis: When MongoDB is killed, catalogue health check continues to report mongo as true, and incoming requests hang or fail with unhandled rejections instead of failing fast.
+== Diagnosis (blind): suspect=mongodb fault=kill confidence=0.95 -> CORRECT (service ok, fault ok)
+   evidence: mongodb container is exited (containers_not_running)
+   evidence: mongodb is marked unhealthy (unhealthy)
+   evidence: endpoints depending on mongodb (catalogue, user) show 29/90 failures
+   evidence: p95_ms increased dramatically to 6022ms
+== Held for 21s before healing (enter)
+== Action attempt 1: start_service(mongodb) ok=True started (was exited)
+== Action attempt 1: restart_web(web) ok=True restarted
+== Healed in 38s
+== Hardening round 1: restart_policy mongodb improved=True (error_rate 0.322 -> 0.0; recovery 38s -> 24s)
+   before -> after: error_rate=[0.322, 0.0] recovery_s=[38, 24] data_survived=[True, True] score=85 -> 98
+== Data survived (cart probe): before=True (cart kept), rerun 1=True (cart kept)
+== Agents: chaos_agent=llm, diagnosis_agent=llm, remediation_agent=llm
+=== Cycle 2/4: mongodb pause ===
+[heal] understand: reusing the campaign's depmap, baseline and code review
+== Auto: weakness #2 of 4: pause mongodb
+[heal] chaos_agent: [llm] pause mongodb {'duration_s': 10}: Chosen autonomously: weakness #2 of 4 from the code review (user/server.js:86) because the user service relies on a static mongoConnected flag.
+[heal] guard_approve: approved
+[heal] inject: pause on mongodb: docker pause (SIGSTOP via freezer cgroup)
+[heal.ports] observe: error_rate=0.0 p95=2870ms unhealthy=['mongodb']
+[heal] observe: attempt 0: error_rate=0.0 p95=2870ms
+[heal] diagnosis_agent: [llm] pause on mongodb: unhealthy.mongodb paused; containers_not_running.mongodb paused (confidence 0.95, correct=True)
+[heal] remediation_agent: [llm] unpause_service(mongodb)
+[heal.ports] heal_fix: unpause_service(mongodb) ok=True: unpaused, now running
+[heal] apply_fix: attempt 1: unpause_service ok=True
+[heal.ports] verify: steady after 24s (4 samples)
+[heal] verify: attempt 1: healed, recovery 24s
+[patcher] 0 live patches (none), 1 code suggestions (llm)
+[heal] harden_agent: round 1: no hardening fix available for this fault, skipping the rerun
+[heal.ports] revert_all: 1 injected fault(s) reverted
+[heal] guard_revert: reverted fault e1 pause on mongodb
+[heal] report: outcome=healed hardening=not_applicable attempts=1 rounds=1
+== Mode: auto campaign (weakness #2 of 4 from the code review)
+== Experiment: pause mongodb {"duration_s": 10}
+   reason: Chosen autonomously: weakness #2 of 4 from the code review (user/server.js:86) because the user service relies on a static mongoConnected flag that is never updated after database failure, potentially leading to wrong connected status during pauses.
+   hypothesis: While MongoDB is paused, user service health checks will report mongo as connected and subsequent user lookup requests will hang; after resuming, health checks will still show connected and the service will recover once the flag is reset.
+== Diagnosis (blind): suspect=mongodb fault=pause confidence=0.95 -> CORRECT (service ok, fault ok)
+   evidence: unhealthy.mongodb paused
+   evidence: containers_not_running.mongodb paused
+   evidence: p95_ms baseline 59 now 2870
+   evidence: mongodb logs indicate connection accepts but no database activity
+== Action attempt 1: unpause_service(mongodb) ok=True unpaused, now running
+== Healed in 24s
+== Hardening: not applicable (no hardening fix available for this fault)
+== Data survived (cart probe): before=True (cart kept)
+== Agents: chaos_agent=llm, diagnosis_agent=llm, remediation_agent=llm
+=== Cycle 3/4: redis latency ===
+[heal] understand: reusing the campaign's depmap, baseline and code review
+== Auto: weakness #3 of 4: latency redis
+[heal] chaos_agent: [llm] latency redis {'delay_ms': 2000, 'duration_s': 10}: Chosen autonomously: weakness #3 of 4 from the code review (cart/server.js:85) because the cart service queries Redis without a timeout.
+[heal] guard_approve: approved
+[heal] inject: latency on redis: tc netem delay 2000ms on eth0
+[heal.ports] observe: error_rate=0.0 p95=2690ms unhealthy=none
+[heal] observe: attempt 0: error_rate=0.0 p95=2690ms
+[heal] diagnosis_agent: [llm] latency on redis: p95_ms baseline 59, now 2690 indicates widespread latency increase; netem list includes "redis" signaling an induced network delay on that service (confidence 0.9, correct=True)
+[heal] remediation_agent: [llm] remove_latency(redis)
+[heal.ports] heal_fix: remove_latency(redis) ok=True: deleted root qdisc; no netem on eth0
+[heal] apply_fix: attempt 1: remove_latency ok=True
+[heal.ports] verify: steady after 31s (3 samples)
+[heal] verify: attempt 1: healed, recovery 31s
+[patcher] 0 live patches (none), 1 code suggestions (llm)
+[heal] harden_agent: round 1: no hardening fix available for this fault, skipping the rerun
+[heal.ports] revert_all: 1 injected fault(s) reverted
+[heal] guard_revert: reverted fault e1 latency on redis
+[heal] report: outcome=healed hardening=not_applicable attempts=1 rounds=1
+== Mode: auto campaign (weakness #3 of 4 from the code review)
+== Experiment: latency redis {"delay_ms": 2000, "duration_s": 10}
+   reason: Chosen autonomously: weakness #3 of 4 from the code review (cart/server.js:85) because the cart service queries Redis without a timeout at line 85 (redisClient.get(req.params.id, (err, data) => {), making it vulnerable to blocking requests when Redis is slow.
+   hypothesis: During the 10-second latency injection, cart retrieval requests will queue up and eventually time out or hang, exhausting the Redis connection pool; once the latency resolves, the service will recover and process pending requests within a few seconds.
+== Diagnosis (blind): suspect=redis fault=latency confidence=0.9 -> CORRECT (service ok, fault ok)
+   evidence: p95_ms baseline 59, now 2690 indicates widespread latency increase
+   evidence: netem list includes "redis" signaling an induced network delay on that service
+   evidence: error_rate remained 0.0 so no errors, just slow responses
+== Action attempt 1: remove_latency(redis) ok=True deleted root qdisc; no netem on eth0
+== Healed in 31s
+== Hardening: not applicable (no hardening fix available for this fault)
+== Data survived (cart probe): before=True (cart kept)
+== Agents: chaos_agent=llm, diagnosis_agent=llm, remediation_agent=llm
+=== Cycle 4/4: redis kill ===
+[heal] understand: reusing the campaign's depmap, baseline and code review
+== Auto: weakness #4 of 4: kill redis
+[heal] chaos_agent: [llm] kill redis {'duration_s': 30}: Chosen autonomously: weakness #4 of 4 from the code review (cart/server.js:379) because the cart service uses redisClient.setex to persist user state, so killing redis will clear that state.
+[heal] guard_approve: approved
+[heal] inject: kill on redis: crash: SIGKILL to main process (restart policy applies)
+[heal.ports] observe: error_rate=0.0 p95=3343ms unhealthy=['redis']
+[heal] observe: attempt 0: error_rate=0.0 p95=3343ms
+[heal] diagnosis_agent: [llm] kill on redis: redis exited; redis unhealthy (confidence 0.93, correct=True)
+[heal] remediation_agent: [llm] start_service(redis) -> restart_web(web)
+[heal.ports] heal_fix: start_service(redis) ok=True: started (was exited)
+[heal.ports] heal_fix: restart_web(web) ok=True: restarted
+[heal] apply_fix: attempt 1: start_service ok=True, restart_web ok=True
+[heal.ports] verify: steady after 31s (11 samples)
+[heal] verify: attempt 1: healed, recovery 31s
+[patcher] 1 live patches (redis_aof redis), 0 code suggestions (llm)
+[heal] harden_agent: round 1: redis_aof redis
+[heal.ports] apply: redis_aof redis
+[heal] apply_hardening: round 1: applied c4-p1
+[heal.ports] observe: error_rate=0.0 p95=2924ms unhealthy=['redis']
+[heal.ports] heal_fix: start_service(redis) ok=True: started (was exited)
+[heal.ports] heal_fix: restart_web(web) ok=True: restarted
+[heal.ports] verify: steady after 26s (11 samples)
+[heal.ports] revert_all: 2 injected fault(s) reverted
+[heal] rerun: round 1: error_rate=0.0 recovery=26s data_survived=True
+[heal] compare: round 1: improved=True (data_survived false -> true)
+[heal] guard_revert: reverted fault e1 kill on redis
+[heal] report: outcome=healed hardening=improved_round1 attempts=1 rounds=1
+== Mode: auto campaign (weakness #4 of 4 from the code review)
+== Experiment: kill redis {"duration_s": 30}
+   reason: Chosen autonomously: weakness #4 of 4 from the code review (cart/server.js:379) because the cart service uses redisClient.setex at line 379 to persist user state, so killing redis will clear that state.
+   hypothesis: During the kill, attempts to access or modify the cart will fail or time out, and after redis restarts the cart service will report healthy but any previously stored cart data will be gone.
+== Diagnosis (blind): suspect=redis fault=kill confidence=0.93 -> CORRECT (service ok, fault ok)
+   evidence: redis exited
+   evidence: redis unhealthy
+   evidence: p95_ms grew from 59 to 3343 after redis exit
+   evidence: services cataloguing user and cart depend on redis
+== Action attempt 1: start_service(redis) ok=True started (was exited)
+== Action attempt 1: restart_web(web) ok=True restarted
+== Healed in 31s
+== Hardening round 1: redis_aof redis improved=True (data_survived false -> true)
+   before -> after: error_rate=[0.0, 0.0] recovery_s=[31, 26] data_survived=[False, True] score=85 -> 98
+== Data survived (cart probe): before=False (cart lost), rerun 1=True (cart kept)
+== Agents: chaos_agent=llm, diagnosis_agent=llm, remediation_agent=llm
+=== Campaign summary: 4 of 4 cycles ===
+# | weakness (file:line) | target | fault | diagnosis correct? | healed in | hardening improved? | score before -> after
+- | -------------------- | ------ | ----- | ------------------ | --------- | ------------------- | ---------------------
+1 | catalogue/server.js:68 | mongodb | kill | yes | 38s | yes (improved_round1) | 85 -> 98
+2 | user/server.js:86 | mongodb | pause | yes | 24s | - (not_applicable) | -
+3 | cart/server.js:85 | redis | latency | yes | 31s | - (not_applicable) | -
+4 | cart/server.js:379 | redis | kill | yes | 31s | yes (improved_round1) | 85 -> 98
+== Hardening kept applied: c1-p1 restart_policy mongodb (cycle 1), c4-p1 redis_aof redis (cycle 4)

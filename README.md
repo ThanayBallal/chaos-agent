@@ -47,5 +47,16 @@ Only containers in the `robot-shop` Compose project can be targeted; faults are 
 ## Team
 See `TEAM.md`. Tools, AI models and third-party libraries used: _fill in before submission_.
 
-## Dashboard
-Run `streamlit run ui/app.py` from the repository root to view the latest heal summary, before-and-after resilience results, code-review findings, dependency evidence, and graph path.
+## Live dashboard
+```
+python -m dashboard.server
+```
+Open http://127.0.0.1:8090. Pick a mode and press **Start run**:
+- **Autonomous: test every weakness** runs `heal.run --auto --all --live --pause-first`. The agent reads the code, ranks the weaknesses and tests each one.
+- **Autonomous: top weakness only** runs `heal.run --auto --live --pause-before-heal`.
+- **Your instruction** runs `heal.run "<instruction>" --live --pause-before-heal`.
+- **Replay a recorded run** streams a real campaign log (`dashboard/sample_campaign.log`) without Docker, as a demo backup.
+
+The service map shows each container's live state from Docker. **Heal now** ends the pause on the broken store, and **Kill switch** creates the `STOP` file, which aborts the run and reverts the active fault. The dashboard only reads `heal.run`'s output and never modifies `heal/`. It listens on 127.0.0.1 only.
+
+The older Streamlit view is still available with `streamlit run ui/app.py`.

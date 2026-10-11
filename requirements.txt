@@ -6,3 +6,5 @@ google-genai>=1.0
 openai>=1.0
 langgraph>=1.0
 streamlit>=1.32
+fastapi>=0.110
+uvicorn>=0.29
