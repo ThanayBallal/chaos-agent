@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chaos Agent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#E9EDF1; --panel:#FFFFFF; --ink:#13202B; --muted:#5B6B79; --line:#D3DAE1;
+  --fault:#C8102E; --fault-soft:#FBE7EA; --hold:#B7791F; --hold-soft:#FBF1DD;
+  --heal:#0B7A6F; --heal-soft:#DDF2EF; --ai:#2B57D6; --ai-soft:#E5ECFD; --idle:#9AA7B3;
+  --r:10px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "IBM Plex Sans","Segoe UI",system-ui,sans-serif}
+code,.mono{font-family:"IBM Plex Mono",Consolas,monospace;font-size:13px}
+button,select,input{font:inherit}
+:focus-visible{outline:3px solid var(--ai);outline-offset:2px}
+
+/* top bar */
+.bar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:14px 24px;background:var(--ink);color:#fff}
+.brand{display:flex;flex-direction:column;margin-right:auto}
+.brand b{font-size:20px;letter-spacing:.2px}
+.brand span{font-size:13px;color:#A9B8C6}
+.ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ctl select,.ctl input[type=text]{background:#22313E;color:#fff;border:1px solid #3A4B5A;border-radius:8px;padding:8px 10px}
+.ctl input[type=text]{width:220px}
+.ctl label{font-size:13px;color:#C9D4DE;display:flex;gap:6px;align-items:center}
+.btn{border:0;border-radius:8px;padding:9px 16px;font-weight:600;cursor:pointer}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.run{background:#fff;color:var(--ink)}
+.healbtn{background:var(--heal);color:#fff}
+.healbtn.pulse{animation:pulse 1.2s ease-in-out infinite}
+.killbtn{background:var(--fault);color:#fff}
+@keyframes pulse{50%{box-shadow:0 0 0 6px rgba(11,122,111,.35)}}
+
+/* now banner */
+.now{display:flex;align-items:center;gap:14px;padding:14px 24px;border-bottom:1px solid var(--line);background:var(--panel)}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--idle);flex:none}
+.now[data-tone=fault] .dot{background:var(--fault)} .now[data-tone=hold] .dot{background:var(--hold)}
+.now[data-tone=heal] .dot{background:var(--heal)} .now[data-tone=ai] .dot{background:var(--ai)}
+.now p{margin:0;font-size:18px;font-weight:500}
+.now small{color:var(--muted);margin-left:auto;white-space:nowrap}
+
+main{padding:20px 24px 40px;display:grid;gap:20px;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr)}
+section{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:18px 20px}
+h2{font-size:16px;margin:0 0 12px;font-weight:600}
+.sub{color:var(--muted);font-size:13px;margin:-8px 0 12px}
+.full{grid-column:1/-1}
+
+/* service map */
+#map svg{width:100%;height:auto;display:block}
+.edge{stroke:#C3CCD5;stroke-width:1.4;fill:none}
+.edge.hot{stroke:var(--fault);stroke-width:2.2;stroke-dasharray:6 4}
+.node rect{fill:#F4F7F9;stroke:#B9C4CE;stroke-width:1.5;rx:9}
+.node text{font-size:13px;font-weight:600;fill:var(--ink)}
+.node .st{font-size:11px;font-weight:500;fill:var(--muted)}
+.node.down rect{fill:var(--fault-soft);stroke:var(--fault);stroke-width:2.5}
+.node.down .st{fill:var(--fault)}
+.node.frozen rect,.node.slow rect,.node.stressed rect{fill:var(--hold-soft);stroke:var(--hold);stroke-width:2.5}
+.node.frozen .st,.node.slow .st,.node.stressed .st{fill:var(--hold)}
+.node.recovered rect{fill:var(--heal-soft);stroke:var(--heal);stroke-width:2.5}
+.node.recovered .st{fill:var(--heal)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+
+/* vitals */
+.vitals{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.vital{border:1px solid var(--line);border-radius:8px;padding:12px}
+.vital b{display:block;font-size:26px;line-height:1.1;font-weight:600}
+.vital span{font-size:13px;color:var(--muted)}
+.vital.bad b{color:var(--fault)} .vital.good b{color:var(--heal)}
+.track{display:flex;flex-wrap:wrap;gap:6px;margin-top:16px}
+.track span{font-size:12px;padding:4px 9px;border-radius:999px;background:#EEF2F5;color:var(--muted)}
+.track span.done{background:#DDE6EE;color:var(--ink)}
+.track span.on{background:var(--ink);color:#fff}
+
+/* weaknesses */
+.weak{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:4px 12px;padding:12px 0;border-top:1px solid var(--line);cursor:pointer}
+.weak:first-of-type{border-top:0}
+.weak .rk{font-weight:700;color:var(--muted)}
+.weak .wh{font-weight:600}
+.weak code{grid-column:2/4;background:#F2F5F8;padding:4px 8px;border-radius:6px;overflow-x:auto;white-space:pre}
+.weak p{grid-column:2/4;margin:0;color:var(--muted);font-size:14px}
+.weak.sel{background:linear-gradient(90deg,var(--ai-soft),transparent);margin:0 -20px;padding-left:20px;padding-right:20px}
+.pill{font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;white-space:nowrap;align-self:start}
+.p-wait{background:#EEF2F5;color:var(--muted)} .p-run{background:var(--hold-soft);color:var(--hold)}
+.p-ok{background:var(--heal-soft);color:var(--heal)} .p-bad{background:var(--fault-soft);color:var(--fault)}
+.p-ai{background:var(--ai-soft);color:var(--ai)}
+
+/* story */
+.story{list-style:none;margin:0;padding:0;counter-reset:s}
+.story>li{position:relative;padding:0 0 18px 40px;counter-increment:s}
+.story>li::before{content:counter(s);position:absolute;left:0;top:0;width:26px;height:26px;border-radius:50%;
+  display:grid;place-items:center;font-size:13px;font-weight:700;background:#EEF2F5;color:var(--muted)}
+.story>li::after{content:"";position:absolute;left:12.5px;top:28px;bottom:2px;width:1px;background:var(--line)}
+.story>li:last-child::after{display:none}
+.story>li.ok::before{background:var(--heal);color:#fff}
+.story>li.bad::before{background:var(--fault);color:#fff}
+.story>li.ai::before{background:var(--ai);color:#fff}
+.story>li.wait{opacity:.45}
+.story h3{margin:2px 0 4px;font-size:15px}
+.story p{margin:0 0 4px;font-size:14px;overflow-wrap:anywhere}
+.story ul{margin:4px 0 0;padding-left:18px;font-size:13px;color:var(--muted);list-style:disc}
+.story ul li{padding:0;margin:2px 0}
+.ba{display:grid;grid-template-columns:auto 1fr 1fr;gap:4px 16px;font-size:14px;margin-top:6px}
+.ba div:nth-child(3n+1){color:var(--muted)}
+.ba .up{color:var(--heal);font-weight:600} .ba .dn{color:var(--fault);font-weight:600}
+.cyc{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.cyc button{border:1px solid var(--line);background:#fff;border-radius:8px;padding:5px 11px;cursor:pointer;font-size:13px}
+.cyc button.sel{background:var(--ink);color:#fff;border-color:var(--ink)}
+
+/* results */
+#results{overflow-x:auto}
+table{width:100%;min-width:640px;border-collapse:collapse;font-size:14px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:13px;padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:10px;border-bottom:1px solid var(--line)}
+.empty{color:var(--muted);font-size:14px;margin:0}
+details summary{cursor:pointer;font-weight:600}
+#log{max-height:320px;overflow:auto;background:#0F1A23;color:#CFE0EC;border-radius:8px;padding:12px;margin-top:12px;
+  font-family:"IBM Plex Mono",Consolas,monospace;font-size:12px;white-space:pre-wrap}
+
+@media (max-width:980px){main{grid-template-columns:minmax(0,1fr)}.vitals{grid-template-columns:1fr 1fr 1fr}}
+@media (max-width:600px){.vitals{grid-template-columns:1fr}.bar,.now,main{padding-left:16px;padding-right:16px}
+  .ctl input[type=text]{width:100%}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><b>Chaos Agent</b><span>Reads the code, breaks the weak spot, diagnoses blind, heals, hardens</span></div>
+  <div class="ctl">
+    <select id="mode" aria-label="Run mode">
+      <option value="campaign">Autonomous: test every weakness</option>
+      <option value="auto">Autonomous: top weakness only</option>
+      <option value="prompt">Your instruction</option>
+      <option value="replay">Replay a recorded run</option>
+    </select>
+    <input id="prompt" type="text" placeholder="e.g. kill redis" aria-label="Instruction" hidden>
+    <label><input id="pause" type="checkbox" checked> Pause on the broken store</label>
+    <button class="btn run" id="go">Start run</button>
+    <button class="btn healbtn" id="heal" disabled>Heal now</button>
+    <button class="btn killbtn" id="kill" disabled>Kill switch</button>
+  </div>
+</header>
+
+<div class="now" id="now" data-tone="idle"><span class="dot"></span><p id="nowtxt">Ready. Robot Shop status updates live below.</p><small id="nowmeta"></small></div>
+
+<main>
+  <section id="map">
+    <h2>Robot Shop, live</h2>
+    <p class="sub" id="mapsub">12 services and how they depend on each other</p>
+    <svg id="svg" viewBox="0 0 760 360" role="img" aria-label="Service dependency map"></svg>
+    <div class="legend"><span><i style="background:#F4F7F9;border:1px solid #B9C4CE"></i>Healthy</span>
+      <span><i style="background:var(--fault)"></i>Crashed</span><span><i style="background:var(--hold)"></i>Frozen, slowed or starved</span>
+      <span><i style="background:var(--heal)"></i>Just recovered</span></div>
+  </section>
+
+  <section>
+    <h2>Vital signs</h2>
+    <div class="vitals">
+      <div class="vital" id="v-store"><b>—</b><span>Storefront</span></div>
+      <div class="vital" id="v-p95"><b>—</b><span>Slowest 5% of requests</span></div>
+      <div class="vital" id="v-err"><b>—</b><span>Failed requests</span></div>
+    </div>
+    <div class="track" id="track"></div>
+    <div class="vitals" style="margin-top:16px">
+      <div class="vital" id="v-diag"><b>—</b><span>Blind diagnoses correct</span></div>
+      <div class="vital" id="v-heal"><b>—</b><span>Average time to heal</span></div>
+      <div class="vital" id="v-score"><b>—</b><span>Resilience score</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Weaknesses the AI found in the code</h2>
+    <p class="sub" id="revsub">Appears when a run starts reading the source</p>
+    <div id="weaks"><p class="empty">Start a run to see what the code review finds.</p></div>
+  </section>
+
+  <section>
+    <h2>What happened</h2>
+    <div class="cyc" id="cycbtns"></div>
+    <div id="story"><p class="empty">Each experiment is told here step by step, from the weakness to the proof of the fix.</p></div>
+  </section>
+
+  <section class="full">
+    <h2>Results</h2>
+    <div id="results"><p class="empty">The summary table fills in when the run ends.</p></div>
+  </section>
+
+  <section class="full">
+    <details><summary>Raw pipeline output</summary><div id="log" aria-live="off"></div></details>
+  </section>
+</main>
+
+<script>
+const NODES=["understand","chaos_agent","guard_approve","inject","hold","observe","diagnosis_agent","remediation_agent",
+  "apply_fix","verify","harden_agent","apply_hardening","rerun","compare","guard_revert","report"];
+const LABEL={understand:"Read code",chaos_agent:"Choose target",guard_approve:"Safety check",inject:"Break",hold:"Hold",
+  observe:"Observe",diagnosis_agent:"Diagnose blind",remediation_agent:"Plan fix",apply_fix:"Heal",verify:"Verify",
+  harden_agent:"Plan hardening",apply_hardening:"Harden",rerun:"Break again",compare:"Compare",guard_revert:"Clean up",report:"Report"};
+const POS={web:[70,180],ratings:[420,40],catalogue:[270,70],user:[270,145],cart:[270,220],shipping:[270,295],
+  mongodb:[620,95],redis:[620,190],mysql:[620,270],payment:[420,330],rabbitmq:[620,330],dispatch:[620,330]};
+POS.rabbitmq=[560,330];POS.dispatch=[700,330];
+const EDGES=[["web","catalogue"],["web","user"],["web","cart"],["web","shipping"],["web","payment"],["web","ratings"],
+  ["catalogue","mongodb"],["user","mongodb"],["user","redis"],["cart","redis"],["cart","catalogue"],["shipping","mysql"],
+  ["shipping","cart"],["ratings","mysql"],["ratings","catalogue"],["payment","rabbitmq"],["payment","cart"],["payment","user"],
+  ["dispatch","rabbitmq"]];
+const FAULT={kill:"down",pause:"frozen",latency:"slow",cpu_stress:"stressed"};
+const WORD={down:"crashed",frozen:"frozen",slow:"slowed",stressed:"CPU starved",recovered:"recovered",running:"running"};
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+let S;
+function fresh(){S={weak:{},order:[],cycles:[],sel:null,node:null,done:new Set(),overlay:{},recovered:{},
+  metrics:null,summary:[],holding:false,review:null,status:"idle",replay:false};}
+fresh();
+
+function cyc(){ if(!S.cycles.length){S.cycles.push({k:1,n:1,ev:{}});S.sel=0;} return S.cycles[S.cycles.length-1]; }
+let lastDetail=null;
+
+function onEvent(e){
+  const c=()=>cyc();
+  switch(e.t){
+    case "review": S.review=e; break;
+    case "weakness": S.weak[e.rank]={...e,status:"wait"}; S.order.push(e.rank); lastDetail=S.weak[e.rank]; break;
+    case "detail": {
+      if(e.of==="weakness"&&lastDetail) lastDetail[e.key]=e.value;
+      else if(e.of==="experiment") c().ev[e.key]=e.value;
+      else if(e.of==="diagnosis"){const d=c().ev.diag; if(d)(d.evidence=d.evidence||[]).push(e.value);}
+      break;}
+    case "cycle": S.cycles.push({k:e.k,n:e.n,target:e.target,fault:e.fault,ev:{}}); S.sel=S.cycles.length-1;
+      if(S.weak[e.k]) S.weak[e.k].status="run"; S.done=new Set(); break;
+    case "chosen": c().ev.chosen=e; c().target=c().target||e.target; c().fault=c().fault||e.fault; break;
+    case "experiment": c().ev.exp=e; break;
+    case "injected": S.overlay[e.target]=FAULT[e.fault]||"down"; delete S.recovered[e.target]; c().ev.broke=e; break;
+    case "hold_wait": S.holding=true; break;
+    case "hold_end": S.holding=false; break;
+    case "metrics": S.metrics=e; break;
+    case "diagnosis": c().ev.diag={...e,evidence:[]}; break;
+    case "action": (c().ev.actions=c().ev.actions||[]).push(e);
+      if(e.ok){delete S.overlay[e.service]; S.recovered[e.service]=Date.now();} break;
+    case "healed": c().ev.healed=e; S.holding=false;
+      {const w=S.weak[c().k]; if(w&&S.cycles.length>0&&c().n>1) w.status="ok";} break;
+    case "not_healed": c().ev.notHealed=e; S.holding=false; {const w=S.weak[c().k]; if(w) w.status="bad";} break;
+    case "hardening": c().ev.hard=e; break;
+    case "hardening_na": c().ev.hardNA=e; break;
+    case "before_after": c().ev.ba=e; break;
+    case "survived": c().ev.surv=e; break;
+    case "agents": c().ev.agents=e.agents; break;
+    case "summary_row": S.summary.push(e); break;
+    case "summary_start": {const m=/(\d+) of (\d+) cycles(?:, stopped: (.*))?/.exec(e.text||""); if(m){S.ran=+m[1];S.of=+m[2];S.stopped=m[3]||null;}} break;
+    case "node":
+      if(S.node&&S.node!==e.node) S.done.add(S.node); S.node=e.node; S.nodeMsg=e.msg;
+      if(e.node==="guard_revert"){ for(const k in S.overlay) delete S.overlay[k]; }
+      if(e.node==="report"&&S.cycles.length) {const w=S.weak[c().k]; if(w&&w.status==="run") w.status=c().ev.healed?"ok":"bad";}
+      break;
+  }
+}
+
+/* ---------- rendering ---------- */
+let LIVE={services:{},storefront:null};
+function stateOf(svc){
+  const o=S.overlay[svc], d=LIVE.services[svc];
+  if(d==="exited"||d==="dead") return "down";
+  if(d==="paused") return "frozen";
+  if(o) return o;
+  if(S.recovered[svc]&&Date.now()-S.recovered[svc]<15000) return "recovered";
+  return "running";
+}
+function drawMap(){
+  const hot=new Set(Object.keys(POS).filter(s=>["down","frozen","slow","stressed"].includes(stateOf(s))));
+  let h="";
+  for(const [a,b] of EDGES){ if(!POS[a]||!POS[b]) continue;
+    const [x1,y1]=POS[a],[x2,y2]=POS[b];
+    h+=`<path class="edge${hot.has(b)?" hot":""}" d="M${x1+55} ${y1} C ${(x1+x2)/2+20} ${y1}, ${(x1+x2)/2-20} ${y2}, ${x2-55} ${y2}"/>`; }
+  for(const [s,[x,y]] of Object.entries(POS)){ const st=stateOf(s);
+    h+=`<g class="node ${st}" transform="translate(${x-55},${y-21})"><rect width="110" height="42"/>
+      <text x="12" y="18">${s}</text><text class="st" x="12" y="33">${WORD[st]||st}</text></g>`; }
+  $("#svg").innerHTML=h;
+}
+function setNow(tone,txt,meta){ $("#now").dataset.tone=tone; $("#nowtxt").textContent=txt; $("#nowmeta").textContent=meta||""; }
+function narrate(){
+  const c=S.cycles[S.cycles.length-1], ev=c?c.ev:{};
+  const meta=c&&c.n>1?`Experiment ${c.k} of ${c.n}`:"";
+  if(S.status==="idle") return setNow("idle","Ready. Robot Shop status updates live below.");
+  if(S.holding) return setNow("hold",`${c.target} is broken. Look at the store, then press Heal now.`,meta);
+  const n=S.node;
+  if(S.status!=="running"){
+    const n=S.summary.length, ok=S.summary.filter(r=>r.correct==="yes").length, exp=k=>`${k} experiment${k===1?"":"s"}`;
+    const last=S.cycles[S.cycles.length-1];
+    if(S.stopped||last?.ev.notHealed?.why?.includes("kill switch"))
+      return setNow("fault",`Stopped by the kill switch${S.of?` after ${exp(S.ran)} of ${S.of}`:""}. The active fault was reverted.`);
+    return setNow("heal", n?`Run finished: ${exp(n)}, ${ok} of ${n} diagnosed correctly.`:"Run finished.");}
+  if(!c) return setNow("ai","Reading Robot Shop's source code and measuring normal traffic…");
+  const map={chaos_agent:["ai",`Choosing what to break: ${c.target||"…"}`],guard_approve:["ai","The safety guard is checking the plan"],
+    inject:["fault",`Breaking ${c.target}: ${c.fault}`],observe:["fault",`Watching how the store reacts to the ${c.fault} on ${c.target}`],
+    diagnosis_agent:["ai","Diagnosing from symptoms only, without being told what broke"],
+    remediation_agent:["ai","Choosing a fix from the safe action list"],apply_fix:["heal","Applying the fix"],
+    verify:["heal","Waiting for the store to be healthy again"],harden_agent:["ai","Choosing a hardening fix so it survives next time"],
+    apply_hardening:["heal","Applying the hardening fix"],rerun:["fault",`Breaking ${c.target} again to test the hardening`],
+    compare:["ai","Comparing before and after"],guard_revert:["heal","Cleaning up: every fault reverted"],report:["heal","Writing the report"]};
+  const m=map[n]||["ai","Working…"]; setNow(m[0],m[1],meta);
+}
+function vitals(){
+  const sf=LIVE.storefront, vs=$("#v-store");
+  if(S.replay){ const down=Object.keys(S.overlay).length>0; vs.className="vital "+(down?"bad":"good");
+    vs.querySelector("b").textContent=down?"Degraded":"Up"; }
+  else if(sf){ vs.className="vital "+(sf.up?"good":"bad"); vs.querySelector("b").textContent=sf.up?`Up · ${sf.ms} ms`.replace(" · "," "):"Down"; }
+  const m=S.metrics;
+  const live=S.status==="running";
+  $("#v-p95 b").textContent=m?`${m.p95_ms.toLocaleString()} ms`:"—"; $("#v-p95").className="vital "+(live&&m?(m.p95_ms>1000?"bad":"good"):"");
+  $("#v-err b").textContent=m?`${Math.round(m.error_rate*100)}%`:"—"; $("#v-err").className="vital "+(live&&m?(m.error_rate>0.05?"bad":"good"):"");
+  $("#v-p95 span").textContent=live||!m?"Slowest 5% of requests":"Slowest 5% of requests, last measured";
+  $("#v-err span").textContent=live||!m?"Failed requests":"Failed requests, last measured";
+  const dx=S.cycles.filter(c=>c.ev.diag), ok=dx.filter(c=>c.ev.diag.correct).length;
+  $("#v-diag b").textContent=dx.length?`${ok} of ${dx.length}`:"—"; $("#v-diag").className="vital "+(dx.length?(ok===dx.length?"good":"bad"):"");
+  const hs=S.cycles.map(c=>c.ev.healed&&c.ev.healed.seconds).filter(Boolean);
+  $("#v-heal b").textContent=hs.length?`${Math.round(hs.reduce((a,b)=>a+b,0)/hs.length)} s`:"—";
+  const ba=S.cycles.map(c=>c.ev.ba&&c.ev.ba.score).filter(Boolean).pop();
+  $("#v-score b").textContent=ba?`${ba[0]} → ${ba[1]}`:"—"; $("#v-score").className="vital "+(ba&&ba[1]>ba[0]?"good":"");
+  $("#track").innerHTML=NODES.filter(n=>n!=="hold"||S.holding||S.done.has("hold")).map(n=>
+    `<span class="${n===S.node&&S.status==="running"?"on":S.done.has(n)?"done":""}">${LABEL[n]}</span>`).join("");
+}
+function weaks(){
+  if(S.review) $("#revsub").textContent=`Read ${S.review.files} source files (${S.review.source==="llm"?"AI review":"rule-based scan"}), ranked by risk`;
+  if(!S.order.length) return;
+  const pill={wait:["p-wait","Not tested yet"],run:["p-run","Testing now"],ok:["p-ok","Healed"],bad:["p-bad","Not healed"]};
+  $("#weaks").innerHTML=S.order.map(r=>{const w=S.weak[r],p=pill[w.status]; const ci=S.cycles.findIndex(c=>c.k===r&&c.n>1);
+    return `<div class="weak${ci>=0&&ci===S.sel?" sel":""}" data-c="${ci}"><span class="rk">#${r}</span>
+      <span class="wh">${esc(w.service)} → ${esc(w.target)} <span class="mono" style="color:var(--muted);font-weight:400">${esc(w.where)}</span></span>
+      <span class="pill ${p[0]}">${p[1]}</span>${w.code?`<code>${esc(w.code)}</code>`:""}${w.weakness?`<p>${esc(w.weakness)}</p>`:""}</div>`;}).join("");
+  document.querySelectorAll(".weak").forEach(el=>el.onclick=()=>{const i=+el.dataset.c; if(i>=0){S.sel=i;render();}});
+}
+function step(cls,title,body){return `<li class="${cls}"><h3>${title}</h3>${body||""}</li>`;}
+function story(){
+  if(!S.cycles.length) return;
+  $("#cycbtns").innerHTML=S.cycles.length>1?S.cycles.map((c,i)=>
+    `<button class="${i===S.sel?"sel":""}" data-i="${i}">${c.n>1?`#${c.k} `:""}${esc(c.fault||"")} ${esc(c.target||"")}</button>`).join(""):"";
+  document.querySelectorAll("#cycbtns button").forEach(b=>b.onclick=()=>{S.sel=+b.dataset.i;render();});
+  const c=S.cycles[S.sel??S.cycles.length-1], e=c.ev, w=S.weak[c.k]&&c.n>1?S.weak[c.k]:null;
+  let h="";
+  h+=step(w?"ai":"wait","Weakness in the code", w?`<p class="mono">${esc(w.where)}</p>${w.code?`<p><code>${esc(w.code)}</code></p>`:""}<p>${esc(w.weakness||"")}</p>`
+    :`<p>${(e.reason||"").includes("prompt")?"Target given by the operator's instruction.":"Waiting for the code review…"}</p>`);
+  const src=e.chosen?`<span class="pill ${e.chosen.source==="llm"?"p-ai":"p-wait"}">${e.chosen.source==="llm"?"AI decision":"Rule-based"}</span>`:"";
+  h+=step(e.chosen?"ai":"wait",`Decision: ${esc(e.chosen?`${e.chosen.fault} ${e.chosen.target}`:"pending")} ${src}`,
+    e.reason||e.chosen?`<p>${esc(e.reason||e.chosen.reason)}</p>`:"");
+  h+=step(e.hypothesis?"ai":"wait","Prediction before breaking anything", e.hypothesis?`<p>${esc(e.hypothesis)}</p>`:"");
+  h+=step(e.broke?"bad":"wait",`Broke ${esc(c.target||"")}`, e.broke?`<p>${esc(e.broke.fault)} on ${esc(e.broke.target)}, approved by the safety guard</p>`:"");
+  const d=e.diag;
+  h+=step(d?(d.correct?"ok":"bad"):"wait",`Blind diagnosis ${d?`<span class="pill ${d.correct?"p-ok":"p-bad"}">${d.correct?"Correct":"Wrong"}</span>`:""}`,
+    d?`<p>Suspect <b>${esc(d.suspect)}</b>, fault <b>${esc(d.fault)}</b>, ${Math.round(d.confidence*100)}% confident. It was never told what broke.</p>
+      ${d.evidence?.length?`<ul>${d.evidence.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>`:""}`:"");
+  const acts=(e.actions||[]).map(a=>`<li>${esc(a.action)}(${esc(a.service)}) ${a.ok?"done":"failed"}</li>`).join("");
+  h+=step(e.healed?"ok":e.notHealed?"bad":"wait", e.healed?(e.healed.seconds?`Healed in ${e.healed.seconds} s`:"Healed"):e.notHealed?"Not healed":"Heal",
+    (acts?`<ul>${acts}</ul>`:"")+(e.notHealed?`<p>${esc(e.notHealed.why)}</p>`:""));
+  let hb="";
+  if(e.hardNA) hb=`<p>No hardening fix exists for this kind of fault, so the agent reports it honestly instead of claiming one.</p>`;
+  if(e.hard){ hb=`<p>Applied <b>${esc(e.hard.fix)}</b> on ${esc(e.hard.service)}, then broke it again. ${e.hard.improved?"It made a measurable difference:":"No measurable gain:"} ${esc(e.hard.why)}</p>`;
+    const b=e.ba; if(b){ const row=(lab,arr,fmt,good)=>arr?`<div>${lab}</div><div>${fmt(arr[0])}</div><div class="${good(arr)?"up":""}">${fmt(arr[1])}</div>`:"";
+      hb+=`<div class="ba"><div></div><div><b>Before</b></div><div><b>After</b></div>
+        ${row("Test cart",b.data_survived,v=>v?"kept":"lost",a=>!a[0]&&a[1])}
+        ${row("Failed requests",b.error_rate,v=>`${Math.round(v*100)}%`,a=>a[1]<a[0])}
+        ${row("Recovery",b.recovery_s,v=>`${v} s`,a=>a[1]<a[0])}
+        ${row("Resilience score",b.score,v=>v,a=>a[1]>a[0])}</div>`; } }
+  h+=step(e.hard?(e.hard.improved?"ok":"bad"):e.hardNA?"ok":"wait","Harden and prove it",hb);
+  if(e.agents) h+=`<p class="sub" style="margin:4px 0 0">${Object.entries(e.agents).map(([k,v])=>`${k.replace("_agent","")}: ${v==="llm"?"AI":"rule-based"}`).join(", ")}</p>`;
+  $("#story").innerHTML=`<ol class="story">${h}</ol>`;
+}
+function results(){
+  if(!S.summary.length){
+    const c=S.cycles.length===1?S.cycles[0]:null;
+    if(c&&S.status!=="running"&&c.ev.diag){
+      $("#results").innerHTML=`<p class="empty">${esc(c.fault)} ${esc(c.target)}: diagnosis ${c.ev.diag.correct?"correct":"wrong"}, ${c.ev.healed?`healed in ${c.ev.healed.seconds??"?"} s`:"not healed"}${c.ev.hard?`, hardening ${c.ev.hard.improved?"improved":"did not improve"} the result`:""}.</p>`;}
+    return; }
+  $("#results").innerHTML=`<table><thead><tr><th>#</th><th>Weakness</th><th>Experiment</th><th>Diagnosis</th><th>Healed in</th><th>Hardening</th><th>Score</th></tr></thead><tbody>
+    ${S.summary.map(r=>`<tr><td>${r.rank}</td><td class="mono">${esc(r.where)}</td><td>${esc(r.fault)} ${esc(r.target)}</td>
+      <td><span class="pill ${r.correct==="yes"?"p-ok":"p-bad"}">${r.correct==="yes"?"Correct":"Wrong"}</span></td><td>${esc(r.healed)}</td>
+      <td>${r.hardening.startsWith("yes")?'<span class="pill p-ok">Improved</span>':r.hardening.includes("not_applicable")?"No fix applies":esc(r.hardening)}</td>
+      <td>${esc(r.score)}</td></tr>`).join("")}</tbody></table>`;
+}
+function controls(){
+  const run=S.status==="running";
+  $("#go").disabled=run; $("#mode").disabled=run; $("#prompt").disabled=run;
+  $("#heal").disabled=!(run&&S.holding); $("#heal").classList.toggle("pulse",run&&S.holding);
+  $("#kill").disabled=!run;
+}
+function render(){drawMap();narrate();vitals();weaks();story();results();controls();}
+
+/* ---------- wiring ---------- */
+let es=null, seen=0;
+function stream(){
+  if(es) es.close();
+  es=new EventSource(`/api/events?since=${seen}`);
+  es.onmessage=m=>{const d=JSON.parse(m.data); seen=d.i+1;
+    const lg=$("#log"); lg.textContent+=d.line.replace(/\s+$/,"")+"\n"; if(lg.textContent.length>200000) lg.textContent=lg.textContent.slice(-150000);
+    lg.scrollTop=lg.scrollHeight;
+    for(const e of d.events) onEvent(e);
+    if(d.line.startsWith("[dashboard]")) S.status="done";
+    render();};
+}
+async function poll(){
+  try{
+    const st=await (await fetch("/api/state")).json();
+    if(st.status!=="running"&&S.status==="running"){S.status="done";render();}
+    if(!S.replay||S.status!=="running"){
+      const r=await (await fetch("/api/status")).json();
+      if(!r.replay){LIVE={services:r.services||{},storefront:r.storefront};
+        $("#mapsub").textContent=r.docker_error?"Docker isn't reachable, so live container states are unavailable. Start Docker Desktop, then Robot Shop.":"12 services and how they depend on each other";}
+      render();}
+  }catch(_){}
+}
+$("#mode").onchange=()=>{const m=$("#mode").value; $("#prompt").hidden=m!=="prompt"; $("#pause").parentElement.hidden=m==="replay";};
+$("#go").onclick=async()=>{
+  const mode=$("#mode").value, body={mode,prompt:$("#prompt").value,pause:$("#pause").checked,max:4};
+  if(mode==="prompt"&&!body.prompt.trim()){$("#prompt").focus();return setNow("fault","Type an instruction first, for example: kill redis");}
+  fresh(); S.status="running"; S.replay=mode==="replay"; $("#log").textContent="";
+  if(S.replay){LIVE={services:{},storefront:null}; $("#mapsub").textContent="Replaying a recorded live run: service states come from the recording";}
+  $("#weaks").innerHTML='<p class="empty">Reading the source…</p>'; $("#story").innerHTML=""; $("#cycbtns").innerHTML=""; $("#results").innerHTML='<p class="empty">The summary table fills in when the run ends.</p>';
+  const r=await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(!r.ok){S.status="idle";const j=await r.json();render();return setNow("fault",j.detail||"Could not start the run");}
+  seen=0; stream(); render();
+};
+$("#heal").onclick=async()=>{await fetch("/api/heal",{method:"POST"}); S.holding=false; render();};
+$("#kill").onclick=async()=>{await fetch("/api/stop",{method:"POST"}); setNow("fault","Kill switch pressed: the agent is stopping and reverting the active fault");};
+(async()=>{ const st=await (await fetch("/api/state")).json();
+  if(st.status==="running"){S.status="running";S.replay=st.mode==="replay";seen=0;stream();}
+  render(); poll(); setInterval(poll,1500); })();
+</script>
+</body>
+</html>
